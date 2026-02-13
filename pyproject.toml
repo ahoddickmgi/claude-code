@@ -1,0 +1,13 @@
+[project]
+name = "sales-agent"
+version = "0.1.0"
+description = "A sales agent that queries inventory and submits orders to CSRs via email"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic-agent-sdk>=0.1.0",
+    "psycopg2-binary>=2.9",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+sales-agent = "sales_agent.main:main"
