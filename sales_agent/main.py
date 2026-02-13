@@ -54,7 +54,7 @@ def _build_options() -> ClaudeAgentOptions:
             "mcp__sales__create_sales_order",
             "mcp__sales__send_order_to_csr",
         ],
-        permission_mode="bypassPermissions",
+        permission_mode="acceptEdits",
     )
 
 
