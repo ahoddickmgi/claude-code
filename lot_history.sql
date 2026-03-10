@@ -14,20 +14,22 @@
 --     when a lot has >1 PO line – fixed by removing redundant GROUP BY
 -- =============================================================================
 
--- ► Put your lot numbers here once
-DECLARE @lots TABLE (LOT_0 NVARCHAR(30));
+-- ► Put your lot+item combinations here.
+--   If ITMREF_0 is left NULL the filter matches any item for that lot.
+DECLARE @lots TABLE (LOT_0 NVARCHAR(30), ITMREF_0 NVARCHAR(30) NULL);
 INSERT INTO @lots VALUES
-    ('PO004428-3000'),
-    ('PO001649-1000'),
-    ('PO006422-16000'),
-    ('PO005707-2000');
+    ('PO004428-3000',  'PET-SS1100KGSUP'),
+    ('PO001649-1000',  'LLDPE-BAG25KGSR'),
+    ('PO006422-16000', 'PET-SS1100KGSUP'),
+    ('PO005707-2000',  'LDPE-BAG25KGSUP');
 
 WITH
 -- ── 1. Resolve input lots once ────────────────────────────────────────────────
 lot_filter AS (
     SELECT DISTINCT SL.LOT_0, SL.ITMREF_0
     FROM   LIVE.STOLOT SL
-    JOIN   @lots       LF ON LF.LOT_0 = SL.LOT_0
+    JOIN   @lots       LF ON  LF.LOT_0    = SL.LOT_0
+                          AND (LF.ITMREF_0 IS NULL OR LF.ITMREF_0 = SL.ITMREF_0)
 ),
 
 -- ── 2. STOCK: single scan → QOHLBS, STOFLD2_0, STOCOU_0, CURRENTSITE ────────
