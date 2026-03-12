@@ -24,6 +24,12 @@
             "editor": "textfield",
             "isSecret": true
         },
+        "creatorId": {
+            "title": "Creator ID (optional)",
+            "type": "string",
+            "description": "Your Amazon creator ID (e.g. amzn1.creator.xxxx). Leave blank and the scraper will auto-detect it from the page after login. You can find it in the URL when you visit the Creator Connections page in your browser.",
+            "editor": "textfield"
+        },
         "maxCampaigns": {
             "title": "Max Campaigns to Scrape",
             "type": "integer",

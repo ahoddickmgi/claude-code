@@ -8,6 +8,7 @@
  *   email            – Associates account email
  *   password         – Associates account password
  *   otpSecret        – Optional TOTP code for 2FA
+ *   creatorId        – Your amzn1.creator.xxx ID (auto-detected if omitted)
  *   maxCampaigns     – Cap on campaigns scraped (0 = unlimited)
  *   scrapeAsinDetails– Navigate into each campaign for full ASIN list
  *   categories       – Only return campaigns matching these category keywords
@@ -23,17 +24,44 @@ import { PlaywrightCrawler, sleep } from 'crawlee';
 // ---------------------------------------------------------------------------
 
 const BASE_URL = 'https://affiliate-program.amazon.com';
-const CREATOR_CONNECTIONS_URL = `${BASE_URL}/home/promotions/creator-connections`;
-const AMAZON_SIGN_IN_URL = 'https://www.amazon.com/ap/signin';
 const ASIN_REGEX = /\b(B[0-9A-Z]{9}|[0-9]{10})\b/g;
 
+// The actual URL pattern used by the Creator Connections portal.
+// creatorId is user-specific and is extracted automatically after login.
+const REQUESTS_PATH = '/p/connect/requests';
+
 // ---------------------------------------------------------------------------
-// Helpers
+// URL builder
 // ---------------------------------------------------------------------------
 
 /**
- * Checks whether the current page is still an Amazon login/auth page.
+ * Builds the Creator Connections URL with the correct query parameters.
+ * The `categories` param can hold a comma-separated list for server-side filtering.
  */
+function buildCreatorConnectionsUrl(creatorId, categoryFilter = []) {
+    const params = new URLSearchParams({
+        creatorId,
+        status: 'opportunity',
+        type: 'affiliate-plus',
+        sortBy: 'recommended_for_you',
+        keyword: '',
+        filterExpanderStatus: 'false',
+        categories: categoryFilter.join(','),
+        nonFullyClaimedOnly: 'false',
+        campaignStatuses: 'active,pending',
+        topBrandsOnly: 'false',
+        creatorFavoritesOnly: 'false',
+        brands: '',
+        contentType: '',
+        budgetAvailability: '',
+    });
+    return `${BASE_URL}${REQUESTS_PATH}?${params.toString()}`;
+}
+
+// ---------------------------------------------------------------------------
+// Auth helpers
+// ---------------------------------------------------------------------------
+
 async function isOnLoginPage(page) {
     const url = page.url();
     return (
@@ -44,9 +72,6 @@ async function isOnLoginPage(page) {
     );
 }
 
-/**
- * Waits for the Associates dashboard to appear after login.
- */
 async function waitForAssociatesDashboard(page, timeoutMs = 30_000) {
     await page.waitForFunction(
         () => window.location.hostname.includes('affiliate-program.amazon.com'),
@@ -54,118 +79,258 @@ async function waitForAssociatesDashboard(page, timeoutMs = 30_000) {
     );
 }
 
-/**
- * Performs the full Amazon Associates login flow.
- * Handles: email → password → optional OTP/2FA.
- */
 async function loginToAmazonAssociates(page, { email, password, otpSecret }) {
     log.info('Navigating to Amazon Associates login…');
     await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
 
-    // If already authenticated, skip login.
     if (!await isOnLoginPage(page) && page.url().includes('affiliate-program.amazon.com')) {
         log.info('Session already authenticated – skipping login.');
         return;
     }
 
-    // Click the Sign-In link if present on the Associates landing page.
     const signInLink = page.locator('a[href*="signin"], a:has-text("Sign in"), button:has-text("Sign in")').first();
     if (await signInLink.isVisible({ timeout: 5_000 }).catch(() => false)) {
         await signInLink.click();
         await page.waitForLoadState('domcontentloaded');
     }
 
-    // --- Email step ---
     log.info('Entering email…');
     await page.waitForSelector('#ap_email', { timeout: 15_000 });
     await page.fill('#ap_email', email);
     await page.click('#continue');
     await page.waitForLoadState('domcontentloaded');
 
-    // --- Password step ---
     log.info('Entering password…');
     await page.waitForSelector('#ap_password', { timeout: 15_000 });
     await page.fill('#ap_password', password);
     await page.click('#signInSubmit');
     await page.waitForLoadState('domcontentloaded');
 
-    // --- OTP / 2FA step (optional) ---
     const otpInput = page.locator('input[name="otpCode"], input[id*="otp"], input[id*="mfa"]').first();
     if (await otpInput.isVisible({ timeout: 5_000 }).catch(() => false)) {
         if (!otpSecret) {
             throw new Error(
-                'Amazon is requesting a 2FA / OTP code but none was provided in the input. ' +
+                'Amazon is requesting a 2FA / OTP code but none was provided. ' +
                 'Supply the current TOTP code via the "otpSecret" input field.',
             );
         }
         log.info('Entering OTP / 2FA code…');
         await otpInput.fill(otpSecret);
-        const otpSubmit = page.locator('input[type="submit"], button[type="submit"]').first();
-        await otpSubmit.click();
+        await page.locator('input[type="submit"], button[type="submit"]').first().click();
         await page.waitForLoadState('domcontentloaded');
     }
 
-    // Wait until we land on the Associates portal.
     await waitForAssociatesDashboard(page);
     log.info('Login successful.');
 }
 
+// ---------------------------------------------------------------------------
+// creatorId detection
+// ---------------------------------------------------------------------------
+
 /**
- * Extracts all ASINs found in a text string.
+ * Navigates to the Creator Connections landing page and extracts the
+ * creatorId from any URL or anchor that contains it.
  */
-function extractAsins(text) {
-    const matches = text.match(ASIN_REGEX) ?? [];
-    return [...new Set(matches)]; // deduplicate
+async function detectCreatorId(page) {
+    log.info('Auto-detecting creatorId…');
+
+    // First try: navigate to the landing page and watch for a redirect or link
+    // that contains the creatorId query param.
+    await page.goto(`${BASE_URL}${REQUESTS_PATH}`, { waitUntil: 'domcontentloaded' });
+    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+
+    // Check the current URL first (page may have redirected with creatorId).
+    let creatorId = new URL(page.url()).searchParams.get('creatorId');
+    if (creatorId) {
+        log.info(`creatorId found in page URL: ${creatorId}`);
+        return creatorId;
+    }
+
+    // Search the page HTML for the creatorId pattern.
+    creatorId = await page.evaluate(() => {
+        const pattern = /amzn1\.creator\.[a-z0-9-]+/i;
+        // Check all anchor hrefs and script content.
+        for (const el of document.querySelectorAll('a[href], [data-creator-id]')) {
+            const src = el.getAttribute('href') || el.getAttribute('data-creator-id') || '';
+            const match = src.match(pattern);
+            if (match) return match[0];
+        }
+        // Scan the full page source as a last resort.
+        const bodyMatch = document.documentElement.innerHTML.match(pattern);
+        return bodyMatch ? bodyMatch[0] : null;
+    });
+
+    if (creatorId) {
+        log.info(`creatorId found in page source: ${creatorId}`);
+        return creatorId;
+    }
+
+    // Also try the Associates home page.
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+    creatorId = await page.evaluate(() => {
+        const pattern = /amzn1\.creator\.[a-z0-9-]+/i;
+        const bodyMatch = document.documentElement.innerHTML.match(pattern);
+        return bodyMatch ? bodyMatch[0] : null;
+    });
+
+    if (creatorId) {
+        log.info(`creatorId found on Associates home: ${creatorId}`);
+        return creatorId;
+    }
+
+    throw new Error(
+        'Could not auto-detect your creatorId. Please supply it manually via the "creatorId" input field. ' +
+        'You can find it in the URL when you visit the Creator Connections page in your browser: ' +
+        'look for "creatorId=amzn1.creator.xxxx" in the address bar.',
+    );
+}
+
+// ---------------------------------------------------------------------------
+// API response interception
+// ---------------------------------------------------------------------------
+
+/**
+ * Sets up a listener that captures XHR/fetch responses from the campaigns API.
+ * Amazon's Creator Connections page fetches campaign data as JSON — intercepting
+ * this is more reliable than scraping the rendered DOM.
+ *
+ * Returns a getter function: call it to retrieve all captured campaign arrays.
+ */
+function setupApiInterceptor(page) {
+    const captured = [];
+
+    page.on('response', async (response) => {
+        const url = response.url();
+        // Target the internal API endpoints that serve campaign/opportunity data.
+        if (
+            url.includes('/p/connect/') ||
+            url.includes('/associate/') ||
+            url.includes('creatorConnections') ||
+            url.includes('opportunities') ||
+            url.includes('campaigns') ||
+            url.includes('promotions')
+        ) {
+            const ct = response.headers()['content-type'] ?? '';
+            if (!ct.includes('application/json')) return;
+            try {
+                const json = await response.json();
+                captured.push({ url, json });
+                log.debug(`Captured API response from: ${url}`);
+            } catch {
+                // Not valid JSON or already consumed — ignore.
+            }
+        }
+    });
+
+    return () => captured;
 }
 
 /**
- * Parses a commission-rate string like "5%" or "5.00%" into a clean string.
+ * Tries to extract campaign records from captured API responses.
+ * Amazon's response schema varies; this handles several known shapes.
  */
-function parseCommission(raw) {
-    if (!raw) return null;
-    const match = raw.match(/[\d.]+\s*%/);
-    return match ? match[0].trim() : raw.trim();
-}
+function extractCampaignsFromApiResponses(responses) {
+    const campaigns = [];
 
-/**
- * Scrapes the ASIN list from an individual campaign detail page/modal.
- * Amazon renders the ASIN table inside the campaign after clicking "View Details".
- */
-async function scrapeCampaignAsins(page) {
-    const asins = new Set();
+    for (const { url, json } of responses) {
+        // Try common response envelope shapes.
+        const candidates = [
+            json,
+            json?.data,
+            json?.result,
+            json?.results,
+            json?.opportunities,
+            json?.campaigns,
+            json?.promotions,
+            json?.items,
+            json?.content,
+        ].filter(Boolean);
 
-    // Wait for ASIN table or list to appear.
-    // Amazon's Creator Connections shows products in a table or grid.
-    const selectors = [
-        '[data-asin]',
-        'td[data-asin]',
-        'div[data-asin]',
-        '.asin',
-        // Generic: any element whose text looks like an ASIN
-        'td, span, div',
-    ];
+        for (const candidate of candidates) {
+            const arr = Array.isArray(candidate) ? candidate : null;
+            if (!arr || arr.length === 0) continue;
 
-    // Collect from data-asin attributes.
-    const asinElements = await page.$$('[data-asin]');
-    for (const el of asinElements) {
-        const asin = await el.getAttribute('data-asin');
-        if (asin && /^B[0-9A-Z]{9}$|^[0-9]{10}$/.test(asin.trim())) {
-            asins.add(asin.trim());
+            // Validate that the array looks like campaign objects.
+            const first = arr[0];
+            if (typeof first !== 'object') continue;
+
+            log.info(`Extracting ${arr.length} campaign(s) from API response: ${url}`);
+
+            for (const item of arr) {
+                const asins = extractAsinsFromObject(item);
+                campaigns.push({
+                    campaignId: item.campaignId ?? item.id ?? item.promotionId ?? null,
+                    brandName: item.brandName ?? item.brand?.name ?? item.sellerName ?? null,
+                    campaignTitle: item.title ?? item.campaignTitle ?? item.name ?? null,
+                    category: item.category ?? item.categoryName ?? item.productCategory ?? null,
+                    commissionRate:
+                        item.commissionRate ?? item.commission ?? item.bountyRate ?? null,
+                    startDate: item.startDate ?? item.campaignStartDate ?? null,
+                    endDate: item.endDate ?? item.campaignEndDate ?? null,
+                    description: item.description ?? item.campaignDescription ?? null,
+                    detailLink: item.detailUrl ?? item.url ?? item.landingPageUrl ?? null,
+                    asins,
+                    asinCount: asins.length,
+                    rawApiData: item,
+                    scrapedAt: new Date().toISOString(),
+                });
+            }
+
+            // Stop after the first matching array shape.
+            break;
         }
     }
 
-    // Also scan the full page text for ASIN patterns as a fallback.
-    const bodyText = await page.evaluate(() => document.body.innerText);
-    for (const asin of extractAsins(bodyText)) {
-        asins.add(asin);
-    }
-
-    return [...asins];
+    return campaigns;
 }
 
 /**
- * Scrolls to the bottom of the campaign list to trigger lazy-loading.
+ * Recursively walks a JSON object and collects any ASIN-shaped strings.
  */
+function extractAsinsFromObject(obj, depth = 0) {
+    if (depth > 6) return [];
+    const asins = new Set();
+
+    const scan = (val) => {
+        if (typeof val === 'string') {
+            for (const m of val.matchAll(ASIN_REGEX)) asins.add(m[0]);
+        } else if (Array.isArray(val)) {
+            for (const v of val) scan(v);
+        } else if (val && typeof val === 'object') {
+            // Shortcut: if there's an explicit asin/ASIN key, use it.
+            const direct = val.asin ?? val.ASIN ?? val.itemAsin ?? val.productAsin;
+            if (direct && /^B[0-9A-Z]{9}$|^[0-9]{10}$/.test(direct)) {
+                asins.add(direct);
+            }
+            for (const v of Object.values(val)) scan(v);
+        }
+    };
+
+    scan(obj);
+    return [...asins];
+}
+
+// ---------------------------------------------------------------------------
+// ASIN helpers
+// ---------------------------------------------------------------------------
+
+function extractAsins(text) {
+    const matches = text.match(ASIN_REGEX) ?? [];
+    return [...new Set(matches)];
+}
+
+function parseCommission(raw) {
+    if (raw == null) return null;
+    if (typeof raw === 'number') return `${raw}%`;
+    const match = String(raw).match(/[\d.]+\s*%/);
+    return match ? match[0].trim() : String(raw).trim();
+}
+
+// ---------------------------------------------------------------------------
+// DOM fallback scraping
+// ---------------------------------------------------------------------------
+
 async function scrollToLoadAllCampaigns(page) {
     let previousHeight = 0;
     for (let i = 0; i < 20; i++) {
@@ -177,9 +342,6 @@ async function scrollToLoadAllCampaigns(page) {
     }
 }
 
-/**
- * Clicks "Load more" / pagination buttons until all campaigns are visible.
- */
 async function clickLoadMoreUntilDone(page) {
     const loadMoreSelectors = [
         'button:has-text("Load more")',
@@ -189,7 +351,7 @@ async function clickLoadMoreUntilDone(page) {
         '.pagination-next',
     ];
 
-    for (let page_num = 0; page_num < 50; page_num++) {
+    for (let i = 0; i < 50; i++) {
         let clicked = false;
         for (const sel of loadMoreSelectors) {
             const btn = page.locator(sel).first();
@@ -206,80 +368,24 @@ async function clickLoadMoreUntilDone(page) {
 }
 
 /**
- * Attempts to select category filter tabs/chips on the Creator Connections page.
- * Amazon may surface a category sidebar, dropdown, or pill-tabs.
- * Returns the number of filter interactions that succeeded.
+ * DOM-based card parser — used only when API interception yields nothing.
  */
-async function applyUiCategoryFilters(page, categories) {
-    let matched = 0;
-    for (const category of categories) {
-        // Common patterns: tab buttons, checkbox labels, chip/pill buttons
-        const selectors = [
-            `button:has-text("${category}")`,
-            `[role="tab"]:has-text("${category}")`,
-            `label:has-text("${category}")`,
-            `[data-testid*="category"]:has-text("${category}")`,
-            `[class*="category"]:has-text("${category}")`,
-            `[class*="filter"]:has-text("${category}")`,
-        ];
-
-        for (const sel of selectors) {
-            const el = page.locator(sel).first();
-            if (await el.isVisible({ timeout: 2_000 }).catch(() => false)) {
-                log.info(`Clicking UI category filter: "${category}"`);
-                await el.click();
-                await page.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => {});
-                await sleep(800);
-                matched++;
-                break;
-            }
-        }
-    }
-    if (matched === 0 && categories.length > 0) {
-        log.info('No UI category filters found — will apply keyword filtering after scraping.');
-    }
-    return matched;
-}
-
-/**
- * Returns true if the campaign matches at least one of the requested category keywords.
- * Checks category label, title, description, and brand name (all case-insensitive).
- */
-function matchesCategories(campaign, categories) {
-    if (!categories || categories.length === 0) return true;
-
-    const haystack = [
-        campaign.category,
-        campaign.campaignTitle,
-        campaign.description,
-        campaign.brandName,
-        campaign.rawCardText,
-    ]
-        .filter(Boolean)
-        .join(' ')
-        .toLowerCase();
-
-    return categories.some((cat) => haystack.includes(cat.toLowerCase()));
-}
-
-/**
- * Parses campaign cards from the Creator Connections listing page.
- * Returns an array of raw campaign objects (without per-ASIN drill-down).
- */
-async function parseCampaignCards(page) {
+async function parseCampaignCardsFromDom(page) {
     return page.evaluate(() => {
         const campaigns = [];
 
-        // Amazon's Creator Connections uses various component structures
-        // depending on the A/B test bucket. We try multiple selectors.
+        // Try selectors from most to least specific.
         const cardSelectors = [
             '[data-testid="campaign-card"]',
-            '.campaign-card',
+            '[data-testid="opportunity-card"]',
             '[class*="CampaignCard"]',
             '[class*="campaign-card"]',
+            '[class*="OpportunityCard"]',
+            '[class*="opportunity-card"]',
+            '[class*="RequestCard"]',
+            '[class*="request-card"]',
             '[class*="promotionCard"]',
             '[class*="PromotionCard"]',
-            // Fallback: any article or section with a heading inside the list
             'article',
             '.promotion-item',
         ];
@@ -294,59 +400,37 @@ async function parseCampaignCards(page) {
             const getText = (sel) => card.querySelector(sel)?.textContent?.trim() ?? null;
             const getAttr = (sel, attr) => card.querySelector(sel)?.getAttribute(attr) ?? null;
 
-            // Extract raw text then hunt for ASINs.
             const cardText = card.innerText ?? card.textContent ?? '';
             const asinMatches = cardText.match(/\b(B[0-9A-Z]{9}|[0-9]{10})\b/g) ?? [];
             const asins = [...new Set(asinMatches)];
 
-            // Campaign identifiers — Amazon embeds these in data-* attributes or hrefs.
             const campaignId =
                 card.dataset.campaignId ??
                 card.dataset.id ??
                 card.dataset.promotionId ??
-                getAttr('a', 'href')?.match(/[?&]id=([^&]+)/)?.[1] ??
+                card.dataset.opportunityId ??
+                getAttr('a', 'href')?.match(/[?&](?:id|campaignId|opportunityId)=([^&]+)/)?.[1] ??
                 null;
-
-            const detailLink = card.querySelector('a')?.href ?? null;
 
             campaigns.push({
                 campaignId,
-                detailLink,
+                detailLink: card.querySelector('a')?.href ?? null,
                 brandName:
-                    getText('[class*="brand"]') ??
-                    getText('[class*="Brand"]') ??
-                    getText('.brand-name') ??
-                    null,
+                    getText('[class*="brand"]') ?? getText('[class*="Brand"]') ?? null,
                 campaignTitle:
-                    getText('h2') ??
-                    getText('h3') ??
-                    getText('[class*="title"]') ??
-                    getText('[class*="Title"]') ??
-                    null,
+                    getText('h2') ?? getText('h3') ??
+                    getText('[class*="title"]') ?? getText('[class*="Title"]') ?? null,
                 commissionRate:
-                    getText('[class*="commission"]') ??
-                    getText('[class*="Commission"]') ??
-                    getText('[class*="rate"]') ??
-                    null,
-                startDate:
-                    getText('[class*="startDate"]') ??
-                    getText('[class*="start-date"]') ??
-                    null,
-                endDate:
-                    getText('[class*="endDate"]') ??
-                    getText('[class*="end-date"]') ??
-                    null,
+                    getText('[class*="commission"]') ?? getText('[class*="Commission"]') ??
+                    getText('[class*="rate"]') ?? null,
+                startDate: getText('[class*="startDate"]') ?? getText('[class*="start-date"]') ?? null,
+                endDate: getText('[class*="endDate"]') ?? getText('[class*="end-date"]') ?? null,
                 description:
-                    getText('[class*="description"]') ??
-                    getText('[class*="Description"]') ??
-                    null,
+                    getText('[class*="description"]') ?? getText('[class*="Description"]') ?? null,
                 category:
-                    getText('[class*="category"]') ??
-                    getText('[class*="Category"]') ??
+                    getText('[class*="category"]') ?? getText('[class*="Category"]') ??
                     getText('[data-testid*="category"]') ??
-                    getText('[class*="tag"]') ??
-                    getText('[class*="Tag"]') ??
-                    null,
+                    getText('[class*="tag"]') ?? getText('[class*="Tag"]') ?? null,
                 asinsFromCard: asins,
                 rawCardText: cardText.substring(0, 500),
             });
@@ -354,6 +438,45 @@ async function parseCampaignCards(page) {
 
         return campaigns;
     });
+}
+
+// ---------------------------------------------------------------------------
+// Category filter (keyword fallback)
+// ---------------------------------------------------------------------------
+
+function matchesCategories(campaign, categories) {
+    if (!categories || categories.length === 0) return true;
+    const haystack = [
+        campaign.category,
+        campaign.campaignTitle,
+        campaign.description,
+        campaign.brandName,
+    ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+    return categories.some((cat) => haystack.includes(cat.toLowerCase()));
+}
+
+// ---------------------------------------------------------------------------
+// Detail page ASIN scraping
+// ---------------------------------------------------------------------------
+
+async function scrapeCampaignAsins(page) {
+    const asins = new Set();
+
+    const asinElements = await page.$$('[data-asin]');
+    for (const el of asinElements) {
+        const asin = await el.getAttribute('data-asin');
+        if (asin && /^B[0-9A-Z]{9}$|^[0-9]{10}$/.test(asin.trim())) {
+            asins.add(asin.trim());
+        }
+    }
+
+    const bodyText = await page.evaluate(() => document.body.innerText);
+    for (const asin of extractAsins(bodyText)) asins.add(asin);
+
+    return [...asins];
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +491,7 @@ const {
     email = '',
     password = '',
     otpSecret = '',
+    creatorId: creatorIdInput = '',
     maxCampaigns = 0,
     scrapeAsinDetails = true,
     categories = [],
@@ -375,10 +499,8 @@ const {
     sessionCookies = [],
 } = input;
 
-// Normalise categories: trim whitespace, drop empty strings.
 const categoryFilter = categories.map((c) => c.trim()).filter(Boolean);
 
-// Validate required credentials (unless cookies supplied).
 if (!sessionCookies.length && (!email || !password)) {
     throw new Error(
         'You must provide either "email" + "password", or pre-authenticated "sessionCookies" in the actor input.',
@@ -386,7 +508,6 @@ if (!sessionCookies.length && (!email || !password)) {
 }
 
 const proxy = proxyConfig ? await Actor.createProxyConfiguration(proxyConfig) : undefined;
-
 const dataset = await Actor.openDataset();
 
 const crawler = new PlaywrightCrawler({
@@ -401,165 +522,166 @@ const crawler = new PlaywrightCrawler({
             ],
         },
     },
-    // Stealth: mask automation signals.
     preNavigationHooks: [
         async ({ page }) => {
             await page.addInitScript(() => {
-                // Hide WebDriver flag.
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                // Spoof plugin count.
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             });
         },
     ],
+
     async requestHandler({ page, request }) {
-        const label = request.label;
+        if (request.label !== 'LOGIN') return;
 
-        if (label === 'LOGIN') {
-            // ------------------------------------------------------------------
-            // Step 1: Authenticate
-            // ------------------------------------------------------------------
-            if (sessionCookies.length > 0) {
-                log.info(`Injecting ${sessionCookies.length} session cookies…`);
-                await page.context().addCookies(sessionCookies);
-                await page.goto(CREATOR_CONNECTIONS_URL, { waitUntil: 'domcontentloaded' });
-            } else {
-                await loginToAmazonAssociates(page, { email, password, otpSecret });
-                await page.goto(CREATOR_CONNECTIONS_URL, { waitUntil: 'domcontentloaded' });
-            }
-
-            // Wait for the Creator Connections page to render its campaigns.
-            log.info('Waiting for Creator Connections page to load…');
-            await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
-            await sleep(2000);
-
-            // ------------------------------------------------------------------
-            // Step 2: Apply UI category filters (if the page has filter controls).
-            // ------------------------------------------------------------------
-            if (categoryFilter.length > 0) {
-                log.info(`Applying category filters: ${categoryFilter.join(', ')}`);
-                await applyUiCategoryFilters(page, categoryFilter);
-            }
-
-            // ------------------------------------------------------------------
-            // Step 3: Scroll / paginate to reveal all campaigns.
-            // ------------------------------------------------------------------
-            log.info('Loading all campaigns…');
-            await scrollToLoadAllCampaigns(page);
-            await clickLoadMoreUntilDone(page);
-
-            // ------------------------------------------------------------------
-            // Step 4: Parse campaign cards from the listing page.
-            // ------------------------------------------------------------------
-            log.info('Parsing campaign cards…');
-            const allCampaigns = await parseCampaignCards(page);
-            log.info(`Found ${allCampaigns.length} campaign card(s) on the listing page.`);
-
-            // ------------------------------------------------------------------
-            // Step 5: Keyword-based category filter (catches what the UI missed).
-            // ------------------------------------------------------------------
-            const campaigns = categoryFilter.length > 0
-                ? allCampaigns.filter((c) => matchesCategories(c, categoryFilter))
-                : allCampaigns;
-
-            if (categoryFilter.length > 0) {
-                log.info(
-                    `Category filter "${categoryFilter.join(', ')}" matched ${campaigns.length}/${allCampaigns.length} campaign(s).`,
-                );
-            }
-
-            if (campaigns.length === 0) {
-                // If the standard card parsing found nothing, save a debug snapshot.
-                log.warning(
-                    'No campaigns found with standard selectors. Saving a page snapshot for debugging.',
-                );
-                const html = await page.content();
-                await Actor.setValue('debug_page_html', html, { contentType: 'text/html' });
-                const screenshot = await page.screenshot({ fullPage: true });
-                await Actor.setValue('debug_screenshot', screenshot, { contentType: 'image/png' });
-                return;
-            }
-
-            // Respect the maxCampaigns cap.
-            const limit = maxCampaigns > 0 ? maxCampaigns : campaigns.length;
-            const toProcess = campaigns.slice(0, limit);
-
-            if (!scrapeAsinDetails) {
-                // Fast path: save what we already have from the cards.
-                for (const campaign of toProcess) {
-                    await dataset.pushData({
-                        ...campaign,
-                        category: campaign.category ?? null,
-                        asins: campaign.asinsFromCard,
-                        asinCount: campaign.asinsFromCard.length,
-                        scrapedAt: new Date().toISOString(),
-                    });
-                }
-                log.info(`Saved ${toProcess.length} campaigns (card-level data only).`);
-                return;
-            }
-
-            // ------------------------------------------------------------------
-            // Step 4 (optional): Drill into each campaign for full ASIN list.
-            // ------------------------------------------------------------------
-            for (const [i, campaign] of toProcess.entries()) {
-                log.info(`Processing campaign ${i + 1}/${toProcess.length}: "${campaign.campaignTitle}"`);
-
-                let asins = campaign.asinsFromCard;
-
-                if (campaign.detailLink) {
-                    try {
-                        await page.goto(campaign.detailLink, { waitUntil: 'domcontentloaded' });
-                        await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
-                        await sleep(1500);
-
-                        // Try to reveal the full ASIN list — some campaigns hide it behind
-                        // a "View all products" expander.
-                        const expandBtns = [
-                            'button:has-text("View all")',
-                            'button:has-text("Show all")',
-                            'button:has-text("See all products")',
-                            '[data-testid="view-all-products"]',
-                        ];
-                        for (const sel of expandBtns) {
-                            const btn = page.locator(sel).first();
-                            if (await btn.isVisible({ timeout: 1_500 }).catch(() => false)) {
-                                await btn.click();
-                                await sleep(1000);
-                            }
-                        }
-
-                        asins = await scrapeCampaignAsins(page);
-                        log.info(`  → Found ${asins.length} ASIN(s) on detail page.`);
-                    } catch (err) {
-                        log.warning(`  → Could not load detail page (${err.message}). Using card-level ASINs.`);
-                    }
-                }
-
-                // Merge any ASINs found on the card with those from the detail page.
-                const allAsins = [...new Set([...campaign.asinsFromCard, ...asins])];
-
-                await dataset.pushData({
-                    campaignId: campaign.campaignId,
-                    brandName: campaign.brandName,
-                    campaignTitle: campaign.campaignTitle,
-                    category: campaign.category ?? null,
-                    commissionRate: parseCommission(campaign.commissionRate),
-                    startDate: campaign.startDate,
-                    endDate: campaign.endDate,
-                    description: campaign.description,
-                    detailLink: campaign.detailLink,
-                    asins: allAsins,
-                    asinCount: allAsins.length,
-                    scrapedAt: new Date().toISOString(),
-                });
-
-                // Polite delay between detail-page requests.
-                await sleep(800 + Math.random() * 700);
-            }
-
-            log.info(`Done. Saved ${toProcess.length} campaigns to the dataset.`);
+        // ------------------------------------------------------------------
+        // Step 1: Authenticate
+        // ------------------------------------------------------------------
+        if (sessionCookies.length > 0) {
+            log.info(`Injecting ${sessionCookies.length} session cookies…`);
+            await page.context().addCookies(sessionCookies);
+            // Navigate to base first to set cookies on the right domain.
+            await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+        } else {
+            await loginToAmazonAssociates(page, { email, password, otpSecret });
         }
+
+        // ------------------------------------------------------------------
+        // Step 2: Resolve creatorId
+        // ------------------------------------------------------------------
+        const creatorId = creatorIdInput.trim() || await detectCreatorId(page);
+        log.info(`Using creatorId: ${creatorId}`);
+
+        // ------------------------------------------------------------------
+        // Step 3: Set up API response interception, then navigate
+        // ------------------------------------------------------------------
+        const getApiResponses = setupApiInterceptor(page);
+
+        const targetUrl = buildCreatorConnectionsUrl(creatorId, categoryFilter);
+        log.info(`Navigating to: ${targetUrl}`);
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+
+        log.info('Waiting for Creator Connections page to load…');
+        await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+        await sleep(3000);
+
+        // ------------------------------------------------------------------
+        // Step 4: Scroll / paginate to trigger all lazy-loaded API calls
+        // ------------------------------------------------------------------
+        log.info('Scrolling to load all campaigns…');
+        await scrollToLoadAllCampaigns(page);
+        await clickLoadMoreUntilDone(page);
+        // Extra wait after scrolling to let final API calls resolve.
+        await sleep(2000);
+
+        // ------------------------------------------------------------------
+        // Step 5: Extract campaigns — prefer API data, fall back to DOM
+        // ------------------------------------------------------------------
+        let campaigns = extractCampaignsFromApiResponses(getApiResponses());
+
+        if (campaigns.length === 0) {
+            log.info('No API responses captured — falling back to DOM scraping…');
+            const domCampaigns = await parseCampaignCardsFromDom(page);
+            log.info(`DOM parser found ${domCampaigns.length} card(s).`);
+
+            if (domCampaigns.length === 0) {
+                log.warning('No campaigns found. Saving debug snapshot.');
+                await Actor.setValue('debug_page_html', await page.content(), { contentType: 'text/html' });
+                await Actor.setValue('debug_screenshot', await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                return;
+            }
+
+            // Convert DOM cards to the unified campaign shape.
+            campaigns = domCampaigns.map((c) => ({
+                campaignId: c.campaignId,
+                brandName: c.brandName,
+                campaignTitle: c.campaignTitle,
+                category: c.category,
+                commissionRate: c.commissionRate,
+                startDate: c.startDate,
+                endDate: c.endDate,
+                description: c.description,
+                detailLink: c.detailLink,
+                asins: c.asinsFromCard,
+                asinCount: c.asinsFromCard.length,
+                rawApiData: null,
+                scrapedAt: new Date().toISOString(),
+                _source: 'dom',
+            }));
+        } else {
+            log.info(`API interception yielded ${campaigns.length} campaign(s).`);
+        }
+
+        // ------------------------------------------------------------------
+        // Step 6: Keyword category filter (catches anything the URL param missed)
+        // ------------------------------------------------------------------
+        if (categoryFilter.length > 0) {
+            const before = campaigns.length;
+            campaigns = campaigns.filter((c) => matchesCategories(c, categoryFilter));
+            log.info(`Category filter matched ${campaigns.length}/${before} campaign(s).`);
+        }
+
+        // ------------------------------------------------------------------
+        // Step 7: Respect maxCampaigns cap
+        // ------------------------------------------------------------------
+        const limit = maxCampaigns > 0 ? maxCampaigns : campaigns.length;
+        const toProcess = campaigns.slice(0, limit);
+
+        // ------------------------------------------------------------------
+        // Step 8: Optional detail-page drill-down for full ASIN list
+        // ------------------------------------------------------------------
+        for (const [i, campaign] of toProcess.entries()) {
+            log.info(`Processing campaign ${i + 1}/${toProcess.length}: "${campaign.campaignTitle}"`);
+
+            let asins = campaign.asins;
+
+            if (scrapeAsinDetails && campaign.detailLink) {
+                try {
+                    await page.goto(campaign.detailLink, { waitUntil: 'domcontentloaded' });
+                    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+                    await sleep(1500);
+
+                    const expandBtns = [
+                        'button:has-text("View all")',
+                        'button:has-text("Show all")',
+                        'button:has-text("See all products")',
+                        '[data-testid="view-all-products"]',
+                    ];
+                    for (const sel of expandBtns) {
+                        const btn = page.locator(sel).first();
+                        if (await btn.isVisible({ timeout: 1_500 }).catch(() => false)) {
+                            await btn.click();
+                            await sleep(1000);
+                        }
+                    }
+
+                    const detailAsins = await scrapeCampaignAsins(page);
+                    asins = [...new Set([...asins, ...detailAsins])];
+                    log.info(`  → ${asins.length} ASIN(s) after detail page.`);
+                } catch (err) {
+                    log.warning(`  → Detail page failed (${err.message}). Using existing ASINs.`);
+                }
+            }
+
+            await dataset.pushData({
+                campaignId: campaign.campaignId,
+                brandName: campaign.brandName,
+                campaignTitle: campaign.campaignTitle,
+                category: campaign.category ?? null,
+                commissionRate: parseCommission(campaign.commissionRate),
+                startDate: campaign.startDate,
+                endDate: campaign.endDate,
+                description: campaign.description,
+                detailLink: campaign.detailLink,
+                asins,
+                asinCount: asins.length,
+                scrapedAt: new Date().toISOString(),
+            });
+
+            await sleep(600 + Math.random() * 600);
+        }
+
+        log.info(`Done. Saved ${toProcess.length} campaigns to the dataset.`);
     },
 
     failedRequestHandler({ request, error }) {
@@ -569,9 +691,8 @@ const crawler = new PlaywrightCrawler({
 
 await crawler.run([
     {
-        url: CREATOR_CONNECTIONS_URL,
+        url: BASE_URL,
         label: 'LOGIN',
-        // Treat this as a unique entry point — no deduplication needed.
         uniqueKey: `login-${Date.now()}`,
     },
 ]);
