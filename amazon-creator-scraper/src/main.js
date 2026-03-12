@@ -10,6 +10,7 @@
  *   otpSecret        – Optional TOTP code for 2FA
  *   maxCampaigns     – Cap on campaigns scraped (0 = unlimited)
  *   scrapeAsinDetails– Navigate into each campaign for full ASIN list
+ *   categories       – Only return campaigns matching these category keywords
  *   proxyConfiguration
  *   sessionCookies   – Pre-authenticated cookies (skips login)
  */
@@ -205,6 +206,63 @@ async function clickLoadMoreUntilDone(page) {
 }
 
 /**
+ * Attempts to select category filter tabs/chips on the Creator Connections page.
+ * Amazon may surface a category sidebar, dropdown, or pill-tabs.
+ * Returns the number of filter interactions that succeeded.
+ */
+async function applyUiCategoryFilters(page, categories) {
+    let matched = 0;
+    for (const category of categories) {
+        // Common patterns: tab buttons, checkbox labels, chip/pill buttons
+        const selectors = [
+            `button:has-text("${category}")`,
+            `[role="tab"]:has-text("${category}")`,
+            `label:has-text("${category}")`,
+            `[data-testid*="category"]:has-text("${category}")`,
+            `[class*="category"]:has-text("${category}")`,
+            `[class*="filter"]:has-text("${category}")`,
+        ];
+
+        for (const sel of selectors) {
+            const el = page.locator(sel).first();
+            if (await el.isVisible({ timeout: 2_000 }).catch(() => false)) {
+                log.info(`Clicking UI category filter: "${category}"`);
+                await el.click();
+                await page.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => {});
+                await sleep(800);
+                matched++;
+                break;
+            }
+        }
+    }
+    if (matched === 0 && categories.length > 0) {
+        log.info('No UI category filters found — will apply keyword filtering after scraping.');
+    }
+    return matched;
+}
+
+/**
+ * Returns true if the campaign matches at least one of the requested category keywords.
+ * Checks category label, title, description, and brand name (all case-insensitive).
+ */
+function matchesCategories(campaign, categories) {
+    if (!categories || categories.length === 0) return true;
+
+    const haystack = [
+        campaign.category,
+        campaign.campaignTitle,
+        campaign.description,
+        campaign.brandName,
+        campaign.rawCardText,
+    ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+
+    return categories.some((cat) => haystack.includes(cat.toLowerCase()));
+}
+
+/**
  * Parses campaign cards from the Creator Connections listing page.
  * Returns an array of raw campaign objects (without per-ASIN drill-down).
  */
@@ -282,6 +340,13 @@ async function parseCampaignCards(page) {
                     getText('[class*="description"]') ??
                     getText('[class*="Description"]') ??
                     null,
+                category:
+                    getText('[class*="category"]') ??
+                    getText('[class*="Category"]') ??
+                    getText('[data-testid*="category"]') ??
+                    getText('[class*="tag"]') ??
+                    getText('[class*="Tag"]') ??
+                    null,
                 asinsFromCard: asins,
                 rawCardText: cardText.substring(0, 500),
             });
@@ -305,9 +370,13 @@ const {
     otpSecret = '',
     maxCampaigns = 0,
     scrapeAsinDetails = true,
+    categories = [],
     proxyConfiguration: proxyConfig,
     sessionCookies = [],
 } = input;
+
+// Normalise categories: trim whitespace, drop empty strings.
+const categoryFilter = categories.map((c) => c.trim()).filter(Boolean);
 
 // Validate required credentials (unless cookies supplied).
 if (!sessionCookies.length && (!email || !password)) {
@@ -365,18 +434,39 @@ const crawler = new PlaywrightCrawler({
             await sleep(2000);
 
             // ------------------------------------------------------------------
-            // Step 2: Scroll / paginate to reveal all campaigns.
+            // Step 2: Apply UI category filters (if the page has filter controls).
+            // ------------------------------------------------------------------
+            if (categoryFilter.length > 0) {
+                log.info(`Applying category filters: ${categoryFilter.join(', ')}`);
+                await applyUiCategoryFilters(page, categoryFilter);
+            }
+
+            // ------------------------------------------------------------------
+            // Step 3: Scroll / paginate to reveal all campaigns.
             // ------------------------------------------------------------------
             log.info('Loading all campaigns…');
             await scrollToLoadAllCampaigns(page);
             await clickLoadMoreUntilDone(page);
 
             // ------------------------------------------------------------------
-            // Step 3: Parse campaign cards from the listing page.
+            // Step 4: Parse campaign cards from the listing page.
             // ------------------------------------------------------------------
             log.info('Parsing campaign cards…');
-            const campaigns = await parseCampaignCards(page);
-            log.info(`Found ${campaigns.length} campaign card(s) on the listing page.`);
+            const allCampaigns = await parseCampaignCards(page);
+            log.info(`Found ${allCampaigns.length} campaign card(s) on the listing page.`);
+
+            // ------------------------------------------------------------------
+            // Step 5: Keyword-based category filter (catches what the UI missed).
+            // ------------------------------------------------------------------
+            const campaigns = categoryFilter.length > 0
+                ? allCampaigns.filter((c) => matchesCategories(c, categoryFilter))
+                : allCampaigns;
+
+            if (categoryFilter.length > 0) {
+                log.info(
+                    `Category filter "${categoryFilter.join(', ')}" matched ${campaigns.length}/${allCampaigns.length} campaign(s).`,
+                );
+            }
 
             if (campaigns.length === 0) {
                 // If the standard card parsing found nothing, save a debug snapshot.
@@ -399,6 +489,7 @@ const crawler = new PlaywrightCrawler({
                 for (const campaign of toProcess) {
                     await dataset.pushData({
                         ...campaign,
+                        category: campaign.category ?? null,
                         asins: campaign.asinsFromCard,
                         asinCount: campaign.asinsFromCard.length,
                         scrapedAt: new Date().toISOString(),
@@ -452,6 +543,7 @@ const crawler = new PlaywrightCrawler({
                     campaignId: campaign.campaignId,
                     brandName: campaign.brandName,
                     campaignTitle: campaign.campaignTitle,
+                    category: campaign.category ?? null,
                     commissionRate: parseCommission(campaign.commissionRate),
                     startDate: campaign.startDate,
                     endDate: campaign.endDate,

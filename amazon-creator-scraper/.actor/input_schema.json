@@ -49,6 +49,16 @@
                 "apifyProxyGroups": ["RESIDENTIAL"]
             }
         },
+        "categories": {
+            "title": "Category Filter (optional)",
+            "type": "array",
+            "description": "Only return campaigns that match one or more of these category keywords. Matching is case-insensitive and checks the campaign title, description, brand name, and any category label on the card. Leave empty to return all categories. Examples: [\"womens fashion\", \"supplements\", \"beauty\", \"electronics\"].",
+            "editor": "stringList",
+            "items": {
+                "type": "string"
+            },
+            "example": ["womens fashion", "supplements"]
+        },
         "sessionCookies": {
             "title": "Session Cookies (optional)",
             "type": "array",
