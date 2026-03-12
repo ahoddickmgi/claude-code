@@ -1,0 +1,63 @@
+{
+    "title": "Amazon Creator Connections Scraper Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "email": {
+            "title": "Amazon Associates Email",
+            "type": "string",
+            "description": "The email address used to log in to Amazon Associates.",
+            "editor": "textfield",
+            "isSecret": false
+        },
+        "password": {
+            "title": "Amazon Associates Password",
+            "type": "string",
+            "description": "The password for your Amazon Associates account.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "otpSecret": {
+            "title": "OTP / 2FA Code (optional)",
+            "type": "string",
+            "description": "If your account uses two-factor authentication, supply the current TOTP code here. Leave blank if 2FA is not enabled.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "maxCampaigns": {
+            "title": "Max Campaigns to Scrape",
+            "type": "integer",
+            "description": "Maximum number of Creator Connections campaigns to scrape. Set to 0 for unlimited.",
+            "default": 0,
+            "minimum": 0,
+            "editor": "number"
+        },
+        "scrapeAsinDetails": {
+            "title": "Scrape ASIN Details",
+            "type": "boolean",
+            "description": "When enabled, the scraper clicks into each campaign to collect the full ASIN list and product details. Slower but more thorough.",
+            "default": true,
+            "editor": "checkbox"
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "description": "Apify proxy settings. Residential proxies are recommended to avoid Amazon bot-detection.",
+            "editor": "proxy",
+            "prefill": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"]
+            }
+        },
+        "sessionCookies": {
+            "title": "Session Cookies (optional)",
+            "type": "array",
+            "description": "Pre-authenticated cookies exported from your browser. Supply these to skip the login flow. Each item should be a Playwright/Puppeteer cookie object.",
+            "editor": "json",
+            "items": {
+                "type": "object"
+            }
+        }
+    },
+    "required": []
+}

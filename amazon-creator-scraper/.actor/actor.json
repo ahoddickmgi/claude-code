@@ -1,0 +1,47 @@
+{
+    "actorSpecification": 1,
+    "name": "amazon-creator-connections-scraper",
+    "title": "Amazon Creator Connections ASIN Scraper",
+    "description": "Logs into Amazon Associates and scrapes all available campaign ASINs from the Creator Connections portal.",
+    "version": "1.0",
+    "buildTag": "latest",
+    "input": "./input_schema.json",
+    "dockerfile": "./Dockerfile",
+    "storages": {
+        "dataset": {
+            "actorSpecification": 1,
+            "title": "Creator Connections Campaigns",
+            "description": "Each item contains a campaign with its associated ASINs and metadata.",
+            "views": {
+                "overview": {
+                    "title": "Campaigns Overview",
+                    "transformation": {
+                        "fields": [
+                            "campaignId",
+                            "brandName",
+                            "campaignTitle",
+                            "commissionRate",
+                            "startDate",
+                            "endDate",
+                            "asinCount",
+                            "asins"
+                        ]
+                    },
+                    "display": {
+                        "component": "table",
+                        "properties": {
+                            "campaignId": { "label": "Campaign ID", "format": "text" },
+                            "brandName": { "label": "Brand", "format": "text" },
+                            "campaignTitle": { "label": "Campaign Title", "format": "text" },
+                            "commissionRate": { "label": "Commission %", "format": "text" },
+                            "startDate": { "label": "Start Date", "format": "text" },
+                            "endDate": { "label": "End Date", "format": "text" },
+                            "asinCount": { "label": "ASIN Count", "format": "number" },
+                            "asins": { "label": "ASINs", "format": "text" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
