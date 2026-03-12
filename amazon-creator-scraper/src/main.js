@@ -72,11 +72,27 @@ async function isOnLoginPage(page) {
     );
 }
 
-async function waitForAssociatesDashboard(page, timeoutMs = 30_000) {
+/**
+ * Waits until the browser has left all Amazon login/auth pages.
+ * More permissive than waiting for a specific hostname — Amazon may land on
+ * amazon.com, amazon.com/associates, or affiliate-program.amazon.com after login.
+ */
+async function waitForLoginComplete(page, timeoutMs = 45_000) {
     await page.waitForFunction(
-        () => window.location.hostname.includes('affiliate-program.amazon.com'),
+        () => {
+            const url = window.location.href;
+            return (
+                !url.includes('/ap/signin') &&
+                !url.includes('/ap/mfa') &&
+                !url.includes('/ap/cvf') &&
+                !url.includes('/ap/challenge') &&
+                !url.includes('signin?') &&
+                !url.includes('sign-in')
+            );
+        },
         { timeout: timeoutMs },
     );
+    log.info(`Post-login URL: ${page.url()}`);
 }
 
 /**
@@ -122,8 +138,12 @@ async function completeLoginFlow(page, { email, password, otpSecret }) {
         await page.waitForLoadState('domcontentloaded');
     }
 
-    await waitForAssociatesDashboard(page);
-    log.info('Login successful.');
+    // Save a screenshot after submitting credentials so we can debug any
+    // CAPTCHA or verification screens Amazon may show.
+    await Actor.setValue('debug_post_login', await page.screenshot(), { contentType: 'image/png' });
+
+    await waitForLoginComplete(page);
+    log.info('Login complete.');
 }
 
 async function loginToAmazonAssociates(page, { email, password, otpSecret }) {
@@ -136,6 +156,11 @@ async function loginToAmazonAssociates(page, { email, password, otpSecret }) {
     }
 
     await completeLoginFlow(page, { email, password, otpSecret });
+
+    // Make sure we land on the Associates portal before proceeding.
+    if (!page.url().includes('affiliate-program.amazon.com')) {
+        await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -586,10 +611,14 @@ const crawler = new PlaywrightCrawler({
                 );
             }
             await completeLoginFlow(page, { email, password, otpSecret });
-            // After login Amazon returns to the originally requested URL, but
-            // navigate explicitly to be safe.
-            log.info(`Re-navigating to: ${targetUrl}`);
-            await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+            // Amazon's openid flow may have already redirected back to the target URL.
+            // Only re-navigate if we're not already there.
+            if (!page.url().includes('/p/connect/requests')) {
+                log.info(`Re-navigating to: ${targetUrl}`);
+                await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+            } else {
+                log.info('Amazon returned us to the target URL automatically.');
+            }
         }
 
         log.info('Waiting for Creator Connections page to load…');
