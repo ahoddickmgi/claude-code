@@ -79,33 +79,35 @@ async function waitForAssociatesDashboard(page, timeoutMs = 30_000) {
     );
 }
 
-async function loginToAmazonAssociates(page, { email, password, otpSecret }) {
-    log.info('Navigating to Amazon Associates login…');
-    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
-
-    if (!await isOnLoginPage(page) && page.url().includes('affiliate-program.amazon.com')) {
-        log.info('Session already authenticated – skipping login.');
-        return;
-    }
-
+/**
+ * Completes the Amazon login flow starting from wherever the page currently is.
+ * Works whether we navigated here ourselves or were redirected by Amazon.
+ */
+async function completeLoginFlow(page, { email, password, otpSecret }) {
+    // Click any "Sign in" link on the Associates landing page if present.
     const signInLink = page.locator('a[href*="signin"], a:has-text("Sign in"), button:has-text("Sign in")').first();
-    if (await signInLink.isVisible({ timeout: 5_000 }).catch(() => false)) {
+    if (await signInLink.isVisible({ timeout: 3_000 }).catch(() => false)) {
         await signInLink.click();
         await page.waitForLoadState('domcontentloaded');
     }
 
-    log.info('Entering email…');
-    await page.waitForSelector('#ap_email', { timeout: 15_000 });
-    await page.fill('#ap_email', email);
-    await page.click('#continue');
-    await page.waitForLoadState('domcontentloaded');
+    // Email step.
+    if (await page.locator('#ap_email').isVisible({ timeout: 8_000 }).catch(() => false)) {
+        log.info('Entering email…');
+        await page.fill('#ap_email', email);
+        await page.click('#continue');
+        await page.waitForLoadState('domcontentloaded');
+    }
 
-    log.info('Entering password…');
-    await page.waitForSelector('#ap_password', { timeout: 15_000 });
-    await page.fill('#ap_password', password);
-    await page.click('#signInSubmit');
-    await page.waitForLoadState('domcontentloaded');
+    // Password step.
+    if (await page.locator('#ap_password').isVisible({ timeout: 8_000 }).catch(() => false)) {
+        log.info('Entering password…');
+        await page.fill('#ap_password', password);
+        await page.click('#signInSubmit');
+        await page.waitForLoadState('domcontentloaded');
+    }
 
+    // OTP / 2FA step.
     const otpInput = page.locator('input[name="otpCode"], input[id*="otp"], input[id*="mfa"]').first();
     if (await otpInput.isVisible({ timeout: 5_000 }).catch(() => false)) {
         if (!otpSecret) {
@@ -122,6 +124,18 @@ async function loginToAmazonAssociates(page, { email, password, otpSecret }) {
 
     await waitForAssociatesDashboard(page);
     log.info('Login successful.');
+}
+
+async function loginToAmazonAssociates(page, { email, password, otpSecret }) {
+    log.info('Navigating to Amazon Associates login…');
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+
+    if (!await isOnLoginPage(page) && page.url().includes('affiliate-program.amazon.com')) {
+        log.info('Session already authenticated – skipping login.');
+        return;
+    }
+
+    await completeLoginFlow(page, { email, password, otpSecret });
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +574,23 @@ const crawler = new PlaywrightCrawler({
         const targetUrl = buildCreatorConnectionsUrl(creatorId, categoryFilter);
         log.info(`Navigating to: ${targetUrl}`);
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+
+        // Amazon sometimes redirects deep URLs back to sign-in even when the
+        // Associates home loaded fine.  Detect and complete login if that happens.
+        if (await isOnLoginPage(page)) {
+            log.info('Redirected to login page — completing login flow…');
+            if (!email || !password) {
+                throw new Error(
+                    'Amazon redirected to the login page but no email/password were provided. ' +
+                    'Add "email" and "password" to the actor input so the scraper can log in.',
+                );
+            }
+            await completeLoginFlow(page, { email, password, otpSecret });
+            // After login Amazon returns to the originally requested URL, but
+            // navigate explicitly to be safe.
+            log.info(`Re-navigating to: ${targetUrl}`);
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+        }
 
         log.info('Waiting for Creator Connections page to load…');
         await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
