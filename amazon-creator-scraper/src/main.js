@@ -97,6 +97,42 @@ async function waitForLoginComplete(page, timeoutMs = 45_000) {
 }
 
 /**
+ * Detects and fills an OTP/TOTP input if one is present on the page.
+ * Handles TOTP authenticator apps by generating the current code from the secret.
+ */
+async function handleOtpIfPresent(page, otpSecret) {
+    const otpInput = page.locator([
+        'input[name="otpCode"]',
+        'input[id="auth-mfa-otpcode"]',
+        'input[id*="otp"]',
+        'input[id*="mfa"]',
+        'input[id*="cvf"]',
+        'input[name="code"]',
+        'input[type="tel"]',
+        'input[id="cvf-input-code"]',
+    ].join(', ')).first();
+
+    if (!await otpInput.isVisible({ timeout: 12_000 }).catch(() => false)) return;
+
+    if (!otpSecret) {
+        log.warning(
+            'Amazon is requesting a 2FA / OTP code but none was provided. ' +
+            'Supply the TOTP secret key via the "otpSecret" input field.',
+        );
+        await Actor.setValue('debug_otp_prompt', await page.screenshot(), { contentType: 'image/png' });
+        return;
+    }
+
+    const totp = new TOTP();
+    const code = totp.generate(otpSecret.replace(/\s/g, '').toUpperCase());
+    log.info(`Entering TOTP code (${code})…`);
+    await otpInput.fill(code);
+    await page.locator('input[type="submit"], button[type="submit"]').first().click();
+    await page.waitForLoadState('domcontentloaded');
+    log.info(`After TOTP submission: ${page.url()}`);
+}
+
+/**
  * Completes the Amazon login flow starting from wherever the page currently is.
  * Works whether we navigated here ourselves or were redirected by Amazon.
  */
@@ -128,43 +164,8 @@ async function completeLoginFlow(page, { email, password, otpSecret, openIdUrl =
     // whatever Amazon shows next (OTP prompt, CAPTCHA, notification, etc.).
     await Actor.setValue('debug_post_login', await page.screenshot(), { contentType: 'image/png' });
 
-    // OTP / 2FA step — covers TOTP authenticator apps, SMS codes, and
-    // Amazon's "Approval required" flows.
-    const otpInput = page.locator([
-        'input[name="otpCode"]',
-        'input[id="auth-mfa-otpcode"]',
-        'input[id*="otp"]',
-        'input[id*="mfa"]',
-        'input[id*="cvf"]',
-        'input[name="code"]',
-        'input[type="tel"]',
-        // Amazon CVF (Customer Verification Flow) uses this id:
-        'input[id="cvf-input-code"]',
-    ].join(', ')).first();
-
-    // Use a generous timeout — the OTP field may be injected dynamically
-    // after a short server round-trip following the password submission.
-    if (await otpInput.isVisible({ timeout: 12_000 }).catch(() => false)) {
-        if (!otpSecret) {
-            log.warning(
-                'Amazon is requesting a 2FA / OTP code but none was provided. ' +
-                'If you use an authenticator app, supply the TOTP secret via the ' +
-                '"otpSecret" input field. SMS-based OTP cannot be automated — use ' +
-                'pre-authenticated sessionCookies instead (export them from a real ' +
-                'browser session where you have already visited the Creator Connections page).',
-            );
-            // Save a screenshot of the OTP prompt for debugging.
-            await Actor.setValue('debug_otp_prompt', await page.screenshot(), { contentType: 'image/png' });
-        } else {
-            // Generate the current 6-digit TOTP code from the secret.
-            const totp = new TOTP();
-            const totpCode = totp.generate(otpSecret.replace(/\s/g, '').toUpperCase());
-            log.info(`Entering TOTP code (${totpCode})…`);
-            await otpInput.fill(totpCode);
-            await page.locator('input[type="submit"], button[type="submit"]').first().click();
-            await page.waitForLoadState('domcontentloaded');
-        }
-    }
+    // OTP / 2FA step — handled by the shared helper.
+    await handleOtpIfPresent(page, otpSecret);
     // interstitial mid-way through the OpenID redirect chain.
     if (page.url().includes('gp/help') || page.url().includes('condition_of_use')) {
         log.info('Conditions of Use page detected — saving screenshot and HTML…');
@@ -198,6 +199,8 @@ async function completeLoginFlow(page, { email, password, otpSecret, openIdUrl =
                     await page.click('#signInSubmit');
                     await page.waitForLoadState('domcontentloaded');
                 }
+                // Handle TOTP after password — Amazon prompts for it even in re-auth flows.
+                await handleOtpIfPresent(page, otpSecret);
                 await waitForLoginComplete(page);
                 log.info(`After second credentials fill: ${page.url()}`);
             }
