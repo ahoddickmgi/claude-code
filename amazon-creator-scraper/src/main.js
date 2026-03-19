@@ -123,28 +123,44 @@ async function completeLoginFlow(page, { email, password, otpSecret, openIdUrl =
         await page.waitForLoadState('domcontentloaded');
     }
 
-    // OTP / 2FA step.
-    const otpInput = page.locator('input[name="otpCode"], input[id*="otp"], input[id*="mfa"]').first();
-    if (await otpInput.isVisible({ timeout: 5_000 }).catch(() => false)) {
-        if (!otpSecret) {
-            throw new Error(
-                'Amazon is requesting a 2FA / OTP code but none was provided. ' +
-                'Supply the current TOTP code via the "otpSecret" input field.',
-            );
-        }
-        log.info('Entering OTP / 2FA code…');
-        await otpInput.fill(otpSecret);
-        await page.locator('input[type="submit"], button[type="submit"]').first().click();
-        await page.waitForLoadState('domcontentloaded');
-    }
-
-    // Save a screenshot after submitting credentials so we can debug any
-    // CAPTCHA or verification screens Amazon may show.
+    // Save a screenshot immediately after the password submit so we can see
+    // whatever Amazon shows next (OTP prompt, CAPTCHA, notification, etc.).
     await Actor.setValue('debug_post_login', await page.screenshot(), { contentType: 'image/png' });
 
-    await waitForLoginComplete(page);
+    // OTP / 2FA step — covers TOTP authenticator apps, SMS codes, and
+    // Amazon's "Approval required" flows.
+    const otpInput = page.locator([
+        'input[name="otpCode"]',
+        'input[id="auth-mfa-otpcode"]',
+        'input[id*="otp"]',
+        'input[id*="mfa"]',
+        'input[id*="cvf"]',
+        'input[name="code"]',
+        'input[type="tel"]',
+        // Amazon CVF (Customer Verification Flow) uses this id:
+        'input[id="cvf-input-code"]',
+    ].join(', ')).first();
 
-    // Amazon sometimes inserts a Conditions of Use notification page as an
+    // Use a generous timeout — the OTP field may be injected dynamically
+    // after a short server round-trip following the password submission.
+    if (await otpInput.isVisible({ timeout: 12_000 }).catch(() => false)) {
+        if (!otpSecret) {
+            log.warning(
+                'Amazon is requesting a 2FA / OTP code but none was provided. ' +
+                'If you use an authenticator app, supply the TOTP secret via the ' +
+                '"otpSecret" input field. SMS-based OTP cannot be automated — use ' +
+                'pre-authenticated sessionCookies instead (export them from a real ' +
+                'browser session where you have already visited the Creator Connections page).',
+            );
+            // Save a screenshot of the OTP prompt for debugging.
+            await Actor.setValue('debug_otp_prompt', await page.screenshot(), { contentType: 'image/png' });
+        } else {
+            log.info('Entering OTP / 2FA code…');
+            await otpInput.fill(otpSecret);
+            await page.locator('input[type="submit"], button[type="submit"]').first().click();
+            await page.waitForLoadState('domcontentloaded');
+        }
+    }
     // interstitial mid-way through the OpenID redirect chain.
     if (page.url().includes('gp/help') || page.url().includes('condition_of_use')) {
         log.info('Conditions of Use page detected — saving screenshot and HTML…');
