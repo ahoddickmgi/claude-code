@@ -579,8 +579,12 @@ const crawler = new PlaywrightCrawler({
         if (sessionCookies.length > 0) {
             log.info(`Injecting ${sessionCookies.length} session cookies…`);
             await page.context().addCookies(sessionCookies);
-            // Navigate to base first to set cookies on the right domain.
-            await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+            // Navigate to Associates home and wait for full JS execution so that
+            // session tokens needed for /p/connect/ routes are properly initialised.
+            log.info('Warming Associates session after cookie injection…');
+            await page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 30_000 }).catch(() => {});
+            await sleep(2000);
+            log.info(`Associates home URL: ${page.url()}`);
         } else {
             await loginToAmazonAssociates(page, { email, password, otpSecret });
         }
@@ -611,19 +615,31 @@ const crawler = new PlaywrightCrawler({
                 );
             }
             await completeLoginFlow(page, { email, password, otpSecret });
+            // After login Amazon may land on amazon.com/gp/help/... or similar.
+            // Visit the Associates home page with networkidle so that its JavaScript
+            // runs and sets the session tokens required for /p/connect/ routes.
+            if (!page.url().startsWith(BASE_URL)) {
+                log.info('Warming Associates session after login…');
+                await page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 30_000 }).catch(() => {});
+                await sleep(2000);
+                log.info(`Associates home URL: ${page.url()}`);
+            }
             // Amazon's openid flow may have already redirected back to the target URL.
             // Only re-navigate if we're not already there.
             if (!page.url().includes('/p/connect/requests')) {
                 log.info(`Re-navigating to: ${targetUrl}`);
                 await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+                log.info(`Post re-navigation URL: ${page.url()}`);
             } else {
                 log.info('Amazon returned us to the target URL automatically.');
             }
         }
 
         log.info('Waiting for Creator Connections page to load…');
+        log.info(`Current URL before networkidle: ${page.url()}`);
         await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
         await sleep(3000);
+        log.info(`Current URL after networkidle: ${page.url()}`);
 
         // ------------------------------------------------------------------
         // Step 4: Scroll / paginate to trigger all lazy-loaded API calls
