@@ -112,7 +112,7 @@ async function handleOtpIfPresent(page, otpSecret) {
         'input[id="cvf-input-code"]',
     ].join(', ')).first();
 
-    if (!await otpInput.isVisible({ timeout: 12_000 }).catch(() => false)) return;
+    if (!await otpInput.isVisible({ timeout: 12_000 }).catch(() => false)) return true;
 
     if (!otpSecret) {
         log.warning(
@@ -120,7 +120,7 @@ async function handleOtpIfPresent(page, otpSecret) {
             'Supply the TOTP secret key via the "otpSecret" input field.',
         );
         await Actor.setValue('debug_otp_prompt', await page.screenshot(), { contentType: 'image/png' });
-        return;
+        return false;
     }
 
     const totp = new TOTP();
@@ -130,6 +130,7 @@ async function handleOtpIfPresent(page, otpSecret) {
     await page.locator('input[type="submit"], button[type="submit"]').first().click();
     await page.waitForLoadState('domcontentloaded');
     log.info(`After TOTP submission: ${page.url()}`);
+    return true;
 }
 
 /**
@@ -165,7 +166,12 @@ async function completeLoginFlow(page, { email, password, otpSecret, openIdUrl =
     await Actor.setValue('debug_post_login', await page.screenshot(), { contentType: 'image/png' });
 
     // OTP / 2FA step — handled by the shared helper.
-    await handleOtpIfPresent(page, otpSecret);
+    // Returns false if OTP was detected but secret not provided (skip waitForLoginComplete).
+    const otpOk = await handleOtpIfPresent(page, otpSecret);
+    if (!otpOk) {
+        log.warning('Cannot proceed past OTP prompt — add "otpSecret" to actor input and re-run.');
+        return;
+    }
     // interstitial mid-way through the OpenID redirect chain.
     if (page.url().includes('gp/help') || page.url().includes('condition_of_use')) {
         log.info('Conditions of Use page detected — saving screenshot and HTML…');
@@ -200,7 +206,11 @@ async function completeLoginFlow(page, { email, password, otpSecret, openIdUrl =
                     await page.waitForLoadState('domcontentloaded');
                 }
                 // Handle TOTP after password — Amazon prompts for it even in re-auth flows.
-                await handleOtpIfPresent(page, otpSecret);
+                const reAuthOtpOk = await handleOtpIfPresent(page, otpSecret);
+                if (!reAuthOtpOk) {
+                    log.warning('Cannot proceed past OTP prompt in re-auth — add "otpSecret" to actor input.');
+                    return;
+                }
                 await waitForLoginComplete(page);
                 log.info(`After second credentials fill: ${page.url()}`);
             }
