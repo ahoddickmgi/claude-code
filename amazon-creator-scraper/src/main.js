@@ -18,6 +18,7 @@
 
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, sleep } from 'crawlee';
+import { TOTP } from 'otplib';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -155,8 +156,11 @@ async function completeLoginFlow(page, { email, password, otpSecret, openIdUrl =
             // Save a screenshot of the OTP prompt for debugging.
             await Actor.setValue('debug_otp_prompt', await page.screenshot(), { contentType: 'image/png' });
         } else {
-            log.info('Entering OTP / 2FA code…');
-            await otpInput.fill(otpSecret);
+            // Generate the current 6-digit TOTP code from the secret.
+            const totp = new TOTP();
+            const totpCode = totp.generate(otpSecret.replace(/\s/g, '').toUpperCase());
+            log.info(`Entering TOTP code (${totpCode})…`);
+            await otpInput.fill(totpCode);
             await page.locator('input[type="submit"], button[type="submit"]').first().click();
             await page.waitForLoadState('domcontentloaded');
         }

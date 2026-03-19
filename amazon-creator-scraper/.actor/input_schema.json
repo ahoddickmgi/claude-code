@@ -18,9 +18,9 @@
             "isSecret": true
         },
         "otpSecret": {
-            "title": "OTP / 2FA Code (optional)",
+            "title": "TOTP Secret Key (optional)",
             "type": "string",
-            "description": "If your account uses two-factor authentication, supply the current TOTP code here. Leave blank if 2FA is not enabled.",
+            "description": "The TOTP secret key for your authenticator app (the base-32 string shown when you set up the authenticator — e.g. JBSWY3DPEHPK3PXP). The scraper generates the current 6-digit code automatically. Leave blank if 2FA is not enabled. Note: SMS-based OTP cannot be automated; switch to an authenticator app in your Amazon account security settings.",
             "editor": "textfield",
             "isSecret": true
         },
