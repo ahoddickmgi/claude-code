@@ -99,7 +99,7 @@ async function waitForLoginComplete(page, timeoutMs = 45_000) {
  * Completes the Amazon login flow starting from wherever the page currently is.
  * Works whether we navigated here ourselves or were redirected by Amazon.
  */
-async function completeLoginFlow(page, { email, password, otpSecret }) {
+async function completeLoginFlow(page, { email, password, otpSecret, openIdUrl = null }) {
     // Click any "Sign in" link on the Associates landing page if present.
     const signInLink = page.locator('a[href*="signin"], a:has-text("Sign in"), button:has-text("Sign in")').first();
     if (await signInLink.isVisible({ timeout: 3_000 }).catch(() => false)) {
@@ -145,25 +145,47 @@ async function completeLoginFlow(page, { email, password, otpSecret }) {
     await waitForLoginComplete(page);
 
     // Amazon sometimes inserts a Conditions of Use notification page as an
-    // interstitial mid-way through the OpenID redirect chain.  We need to
-    // dismiss it so Amazon can complete the redirect back to the return_to
-    // URL (our target Creator Connections page) and issue the
-    // amzn_associates_us OpenID session token.
+    // interstitial mid-way through the OpenID redirect chain.
     if (page.url().includes('gp/help') || page.url().includes('condition_of_use')) {
-        log.info('Conditions of Use page detected — saving screenshot and clicking through…');
+        log.info('Conditions of Use page detected — saving screenshot and HTML…');
         await Actor.setValue('debug_cou_page', await page.screenshot(), { contentType: 'image/png' });
+        await Actor.setValue('debug_cou_html', await page.content(), { contentType: 'text/html' });
 
-        // Amazon's ToS interstitial typically has a submit button.
-        const continueBtn = page.locator(
-            'input[type="submit"], button[type="submit"], [name="accept"], [name="continue"]',
-        ).first();
-        if (await continueBtn.isVisible({ timeout: 5_000 }).catch(() => false)) {
-            log.info('Clicking Continue to resume OpenID flow…');
-            await continueBtn.click();
-            await page.waitForLoadState('domcontentloaded');
-            log.info(`After dismissing Conditions of Use: ${page.url()}`);
+        // The CoU page is a static Amazon help page (gp/help/customer/display.html).
+        // It has NO Accept/Continue button for the OpenID flow — only the site-wide
+        // Amazon search bar submit button (which sends us to amazon.com/).
+        // DO NOT click any generic submit button here.
+        //
+        // If we know the OpenID login URL (supplied by the caller), revisiting it
+        // after a successful credential submission may trigger a silent re-auth:
+        // Amazon records authentication at form-submit time and a subsequent visit
+        // to the same OpenID URL within max_auth_age should redirect straight to
+        // return_to without showing the form again.
+        if (openIdUrl && openIdUrl.includes('openid')) {
+            log.info('Revisiting OpenID URL for silent re-auth…');
+            await page.goto(openIdUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+            log.info(`After OpenID URL revisit: ${page.url()}`);
+            // If Amazon still shows a login form, fill it in one more time.
+            if (await page.locator('#ap_email, #ap_password').first().isVisible({ timeout: 5_000 }).catch(() => false)) {
+                log.info('Silent re-auth requires credentials — filling form again…');
+                if (await page.locator('#ap_email').isVisible({ timeout: 3_000 }).catch(() => false)) {
+                    await page.fill('#ap_email', email);
+                    await page.click('#continue');
+                    await page.waitForLoadState('domcontentloaded');
+                }
+                if (await page.locator('#ap_password').isVisible({ timeout: 5_000 }).catch(() => false)) {
+                    await page.fill('#ap_password', password);
+                    await page.click('#signInSubmit');
+                    await page.waitForLoadState('domcontentloaded');
+                }
+                await waitForLoginComplete(page);
+                log.info(`After second credentials fill: ${page.url()}`);
+            }
         } else {
-            log.info('No Continue button found on Conditions of Use page.');
+            // No OpenID URL — fall back to navigating to the Associates home.
+            log.info('Navigating to Associates home to resume OpenID session…');
+            await page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 30_000 }).catch(() => {});
+            log.info(`After CoU → BASE_URL: ${page.url()}`);
         }
     }
 
@@ -638,43 +660,41 @@ const crawler = new PlaywrightCrawler({
                     'Add "email" and "password" to the actor input so the scraper can log in.',
                 );
             }
-            await completeLoginFlow(page, { email, password, otpSecret });
+            // Capture the OpenID URL before consuming it — we'll pass it to
+            // completeLoginFlow so it can attempt a silent re-auth after any
+            // Conditions of Use interstitial by revisiting this URL.
+            const openIdLoginUrl = page.url();
+            await completeLoginFlow(page, { email, password, otpSecret, openIdUrl: openIdLoginUrl });
 
-            // Best case: the OpenID redirect chain completed and we're already on
-            // the target URL (or somewhere inside the Associates portal).
+            log.info(`Post-login URL: ${page.url()}`);
+
             if (page.url().includes('/p/connect/requests')) {
-                log.info('OpenID flow redirected us to the target URL — no re-navigation needed.');
+                log.info('OpenID flow completed — on target URL.');
             } else {
-                // Ensure we're on the Associates portal before navigating to the target URL.
+                // Ensure we land on the Associates portal before attempting further navigation.
                 if (!page.url().startsWith(BASE_URL)) {
-                    log.info('Warming Associates session…');
+                    log.info('Navigating to Associates home…');
                     await page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 30_000 }).catch(() => {});
                     await sleep(2000);
                     log.info(`Associates home URL: ${page.url()}`);
                 }
 
-                // Save the Associates home page for debugging (helps identify navigation elements).
                 await Actor.setValue('debug_associates_home', await page.screenshot(), { contentType: 'image/png' });
 
                 if (!page.url().includes('/p/connect/requests')) {
-                    // Primary: click the actual Creator Connections nav link in the Associates
-                    // portal sidebar/menu.  This triggers proper SPA navigation (React Router
-                    // handles it, mounts the component, and fires the data fetch API calls).
-                    // A raw pushState is insufficient because /p/connect/ is a separate
-                    // micro-frontend from the Associates home.
+                    // Try to find and click a Creator Connections nav link.
                     const navSelectors = [
-                        `a[href*="/p/connect"]`,
+                        'a[href*="/p/connect"]',
                         'a:has-text("Creator Connections")',
                         'li:has-text("Creator Connections") a',
                         '[data-testid*="creator"] a',
                         'nav a[href*="connect"]',
                         'a[href*="creator-connections"]',
                     ];
-
                     let navigated = false;
                     for (const sel of navSelectors) {
                         const link = page.locator(sel).first();
-                        if (await link.isVisible({ timeout: 3_000 }).catch(() => false)) {
+                        if (await link.isVisible({ timeout: 2_000 }).catch(() => false)) {
                             const href = await link.getAttribute('href').catch(() => '');
                             log.info(`Clicking nav link (${sel}): ${href}`);
                             await link.click();
@@ -686,22 +706,11 @@ const crawler = new PlaywrightCrawler({
                         }
                     }
 
-                    if (!navigated) {
-                        // Fallback: full page.goto — this will trigger an OpenID redirect, but
-                        // on some session states the silent re-auth succeeds without a login form.
-                        log.info('No Creator Connections nav link found — falling back to page.goto…');
+                    if (!navigated && !page.url().includes('/p/connect/requests')) {
+                        // Last resort: direct page.goto to the target URL.
+                        log.info('No nav link found — attempting direct navigation to target URL…');
                         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-                        log.info(`Post goto URL: ${page.url()}`);
-
-                        // If we got redirected to login again, fill credentials one more time.
-                        if (await isOnLoginPage(page)) {
-                            log.info('Still being redirected to login — completing login a second time…');
-                            await completeLoginFlow(page, { email, password, otpSecret });
-                            if (!page.url().includes('/p/connect/requests') && !page.url().startsWith(BASE_URL)) {
-                                await page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 30_000 }).catch(() => {});
-                                await sleep(2000);
-                            }
-                        }
+                        log.info(`URL after direct goto: ${page.url()}`);
                     }
                 }
             }
