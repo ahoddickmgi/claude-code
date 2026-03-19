@@ -653,25 +653,55 @@ const crawler = new PlaywrightCrawler({
                     log.info(`Associates home URL: ${page.url()}`);
                 }
 
-                if (!page.url().includes('/p/connect/requests')) {
-                    // Primary attempt: SPA-style navigation so the Associates React app
-                    // handles the route internally without triggering an HTTP-level
-                    // OpenID redirect.
-                    const targetPath = targetUrl.slice(BASE_URL.length);
-                    log.info(`Attempting SPA navigation to: ${targetPath}`);
-                    await page.evaluate((path) => {
-                        window.history.pushState(null, '', path);
-                        window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
-                    }, targetPath);
-                    await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => {});
-                    await sleep(2000);
-                    log.info(`URL after SPA navigation: ${page.url()}`);
+                // Save the Associates home page for debugging (helps identify navigation elements).
+                await Actor.setValue('debug_associates_home', await page.screenshot(), { contentType: 'image/png' });
 
-                    // Fallback: full page navigation if SPA navigation redirected to login.
-                    if (await isOnLoginPage(page)) {
-                        log.info('SPA navigation triggered login redirect — falling back to page.goto…');
+                if (!page.url().includes('/p/connect/requests')) {
+                    // Primary: click the actual Creator Connections nav link in the Associates
+                    // portal sidebar/menu.  This triggers proper SPA navigation (React Router
+                    // handles it, mounts the component, and fires the data fetch API calls).
+                    // A raw pushState is insufficient because /p/connect/ is a separate
+                    // micro-frontend from the Associates home.
+                    const navSelectors = [
+                        `a[href*="/p/connect"]`,
+                        'a:has-text("Creator Connections")',
+                        'li:has-text("Creator Connections") a',
+                        '[data-testid*="creator"] a',
+                        'nav a[href*="connect"]',
+                        'a[href*="creator-connections"]',
+                    ];
+
+                    let navigated = false;
+                    for (const sel of navSelectors) {
+                        const link = page.locator(sel).first();
+                        if (await link.isVisible({ timeout: 3_000 }).catch(() => false)) {
+                            const href = await link.getAttribute('href').catch(() => '');
+                            log.info(`Clicking nav link (${sel}): ${href}`);
+                            await link.click();
+                            await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+                            await sleep(3000);
+                            log.info(`URL after clicking nav link: ${page.url()}`);
+                            navigated = true;
+                            break;
+                        }
+                    }
+
+                    if (!navigated) {
+                        // Fallback: full page.goto — this will trigger an OpenID redirect, but
+                        // on some session states the silent re-auth succeeds without a login form.
+                        log.info('No Creator Connections nav link found — falling back to page.goto…');
                         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
                         log.info(`Post goto URL: ${page.url()}`);
+
+                        // If we got redirected to login again, fill credentials one more time.
+                        if (await isOnLoginPage(page)) {
+                            log.info('Still being redirected to login — completing login a second time…');
+                            await completeLoginFlow(page, { email, password, otpSecret });
+                            if (!page.url().includes('/p/connect/requests') && !page.url().startsWith(BASE_URL)) {
+                                await page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 30_000 }).catch(() => {});
+                                await sleep(2000);
+                            }
+                        }
                     }
                 }
             }
