@@ -143,7 +143,31 @@ async function completeLoginFlow(page, { email, password, otpSecret }) {
     await Actor.setValue('debug_post_login', await page.screenshot(), { contentType: 'image/png' });
 
     await waitForLoginComplete(page);
-    log.info('Login complete.');
+
+    // Amazon sometimes inserts a Conditions of Use notification page as an
+    // interstitial mid-way through the OpenID redirect chain.  We need to
+    // dismiss it so Amazon can complete the redirect back to the return_to
+    // URL (our target Creator Connections page) and issue the
+    // amzn_associates_us OpenID session token.
+    if (page.url().includes('gp/help') || page.url().includes('condition_of_use')) {
+        log.info('Conditions of Use page detected — saving screenshot and clicking through…');
+        await Actor.setValue('debug_cou_page', await page.screenshot(), { contentType: 'image/png' });
+
+        // Amazon's ToS interstitial typically has a submit button.
+        const continueBtn = page.locator(
+            'input[type="submit"], button[type="submit"], [name="accept"], [name="continue"]',
+        ).first();
+        if (await continueBtn.isVisible({ timeout: 5_000 }).catch(() => false)) {
+            log.info('Clicking Continue to resume OpenID flow…');
+            await continueBtn.click();
+            await page.waitForLoadState('domcontentloaded');
+            log.info(`After dismissing Conditions of Use: ${page.url()}`);
+        } else {
+            log.info('No Continue button found on Conditions of Use page.');
+        }
+    }
+
+    log.info(`Login complete. Final URL: ${page.url()}`);
 }
 
 async function loginToAmazonAssociates(page, { email, password, otpSecret }) {
@@ -615,23 +639,41 @@ const crawler = new PlaywrightCrawler({
                 );
             }
             await completeLoginFlow(page, { email, password, otpSecret });
-            // After login Amazon may land on amazon.com/gp/help/... or similar.
-            // Visit the Associates home page with networkidle so that its JavaScript
-            // runs and sets the session tokens required for /p/connect/ routes.
-            if (!page.url().startsWith(BASE_URL)) {
-                log.info('Warming Associates session after login…');
-                await page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 30_000 }).catch(() => {});
-                await sleep(2000);
-                log.info(`Associates home URL: ${page.url()}`);
-            }
-            // Amazon's openid flow may have already redirected back to the target URL.
-            // Only re-navigate if we're not already there.
-            if (!page.url().includes('/p/connect/requests')) {
-                log.info(`Re-navigating to: ${targetUrl}`);
-                await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-                log.info(`Post re-navigation URL: ${page.url()}`);
+
+            // Best case: the OpenID redirect chain completed and we're already on
+            // the target URL (or somewhere inside the Associates portal).
+            if (page.url().includes('/p/connect/requests')) {
+                log.info('OpenID flow redirected us to the target URL — no re-navigation needed.');
             } else {
-                log.info('Amazon returned us to the target URL automatically.');
+                // Ensure we're on the Associates portal before navigating to the target URL.
+                if (!page.url().startsWith(BASE_URL)) {
+                    log.info('Warming Associates session…');
+                    await page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 30_000 }).catch(() => {});
+                    await sleep(2000);
+                    log.info(`Associates home URL: ${page.url()}`);
+                }
+
+                if (!page.url().includes('/p/connect/requests')) {
+                    // Primary attempt: SPA-style navigation so the Associates React app
+                    // handles the route internally without triggering an HTTP-level
+                    // OpenID redirect.
+                    const targetPath = targetUrl.slice(BASE_URL.length);
+                    log.info(`Attempting SPA navigation to: ${targetPath}`);
+                    await page.evaluate((path) => {
+                        window.history.pushState(null, '', path);
+                        window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+                    }, targetPath);
+                    await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => {});
+                    await sleep(2000);
+                    log.info(`URL after SPA navigation: ${page.url()}`);
+
+                    // Fallback: full page navigation if SPA navigation redirected to login.
+                    if (await isOnLoginPage(page)) {
+                        log.info('SPA navigation triggered login redirect — falling back to page.goto…');
+                        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+                        log.info(`Post goto URL: ${page.url()}`);
+                    }
+                }
             }
         }
 
