@@ -1,0 +1,89 @@
+##############################################################
+# Script  : YSOH_FSC_VALIDATION
+# Object  : GESSOH – Sales Order Entry (screen customization)
+# Purpose : When the delivery type (MDL_0) is 1, 2, 4, or 6
+#           AND the first analytical dimension (CCE_1) is
+#           "NAFTA", verify that a Fuel Surcharge line (FSC)
+#           exists in SDELIVERYD.  If it is missing, display
+#           a warning popup and block the save.
+#
+# Setup   : Development > Scripts > create this script, then
+#           attach it to GESSOH via:
+#           Parameters > Sales > Order parameters > SPE script
+#           (or via the screen customisation tab on GESSOH).
+#
+# Notes   :
+#   - MDL_0    : Delivery mode on the sales-order header (SORDER)
+#   - CCE_1(1) : First occurrence of analytical dimension 1
+#                (adjust the index if CCE_1 is on the order
+#                 lines rather than the header)
+#   - SDELIVERYD: Delivery lines table.  The script filters by
+#                 SOHNUM_0 (source order number) and ITMREF_0.
+#                 If your workflow creates deliveries later,
+#                 consider switching the table to SORDERQ and
+#                 querying [F:SOQ] instead.
+##############################################################
+
+$SACTION
+# ----------------------------------------------------------------
+# Entry point – called by GESSOH for every screen-level action.
+# "SAVSOH"    fires when the user validates/saves the order.
+# ----------------------------------------------------------------
+  Case ACTION
+
+    When "SAVSOH"
+      Gosub CHECK_FSC_REQUIRED
+
+    When Default
+      # nothing
+
+  Endcase
+
+Return
+
+##############################################################
+# Subroutine: CHECK_FSC_REQUIRED
+##############################################################
+$CHECK_FSC_REQUIRED
+
+  Local Integer   : L_FSC_FOUND
+  Local File SDELIVERYD : [TMP_SDD]
+
+  L_FSC_FOUND = 0
+
+  # ----------------------------------------------------------
+  # Guard: only run when BOTH conditions are satisfied
+  #   1. Delivery type (MDL_0) is one of: 1, 2, 4, 6
+  #   2. Analytical dimension CCE_1 (first occurrence) = NAFTA
+  # ----------------------------------------------------------
+  If find([F:SOH]MDL_0, 1, 2, 4, 6) <> 0
+
+    If [F:SOH]CCE_1(1) = "NAFTA"
+
+      # ------------------------------------------------------
+      # Search SDELIVERYD for a line where:
+      #   • SOHNUM_0 matches the current sales order number
+      #   • ITMREF_0 = 'FSC'  (Fuel Surcharge item)
+      # ------------------------------------------------------
+      Filter [TMP_SDD] Where "[TMP_SDD]SOHNUM_0 = '" + [F:SOH]SOHNUM_0 + "'" \
+                         And  "[TMP_SDD]ITMREF_0 = 'FSC'"
+      Read [TMP_SDD] First
+      If fstat = 0
+        # A matching FSC line was found – all good
+        L_FSC_FOUND = 1
+      Endif
+      Filter [TMP_SDD]      # Always clear the filter when done
+
+      # ------------------------------------------------------
+      # No FSC line found – warn the user and block the save
+      # ------------------------------------------------------
+      If L_FSC_FOUND = 0
+        Infbox "This Sales Order Requires a Fuel Surcharge"
+        GESTRETVAL = 1      # Return value 1 cancels the save
+      Endif
+
+    Endif   # CCE_1 = NAFTA
+
+  Endif   # MDL_0 in (1,2,4,6)
+
+Return
