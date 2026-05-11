@@ -1,350 +1,1020 @@
--- =============================================================================
--- Lot History Query  –  Sage X3 / SQL Server
--- Optimized with CTEs to eliminate redundant table scans.
---
--- Original issues fixed:
---   • STOJOU was scanned 12+ times; now 2 scans (agg + string lists)
---   • STOCK was scanned 4 times;   now 1 scan
---   • SINVOICED+STOJOU join was done twice; now once
---   • SORDERQ+SORDERP+STOCK join was done twice; now once
---   • PORDERQ+STOJOU join was done 3 times; now once
---   • STOLOT receipt entries re-filtered 5 times; now once
---   • Main LEFT JOIN STOCK could produce duplicate rows per lot – fixed
---   • POLINEQTY / PORECQTY had GROUP BY inside scalar subquery which errors
---     when a lot has >1 PO line – fixed by removing redundant GROUP BY
--- =============================================================================
-
--- ► Put your lot+item combinations here.
---   If ITMREF_0 is left NULL the filter matches any item for that lot.
-DECLARE @lots TABLE (LOT_0 NVARCHAR(30), ITMREF_0 NVARCHAR(30) NULL);
-INSERT INTO @lots VALUES
-    ('PO004428-3000',  'PET-SS1100KGSUP'),
-    ('PO001649-1000',  'LLDPE-BAG25KGSR'),
-    ('PO006422-16000', 'PET-SS1100KGSUP'),
-    ('PO005707-2000',  'LDPE-BAG25KGSUP');
-
 WITH
--- ── 1. Resolve input lots once ────────────────────────────────────────────────
-lot_filter AS (
-    SELECT DISTINCT SL.LOT_0, SL.ITMREF_0
-    FROM   LIVE.STOLOT SL
-    JOIN   @lots       LF ON  LF.LOT_0    = SL.LOT_0
-                          AND (LF.ITMREF_0 IS NULL OR LF.ITMREF_0 = SL.ITMREF_0)
+
+-- Target lots
+LOTS AS (
+    SELECT DISTINCT SL.LOT_0
+    FROM LIVE.STOLOT SL
+    WHERE SL.LOT_0 <> ''
 ),
 
--- ── 2. STOCK: single scan → QOHLBS, STOFLD2_0, STOCOU_0, CURRENTSITE ────────
---    The original LEFT JOIN to STOCK on the outer query produced duplicate rows
---    when a lot existed in multiple locations.  We aggregate here instead.
-stock_agg AS (
+-- Pre-aggregate STOCK once per lot+item
+STOCK_AGG AS (
     SELECT
-        ST.LOT_0,
         ST.ITMREF_0,
-        SUM(ST.QTYSTU_0)  AS QOHLBS,
-        MAX(ST.STOFLD2_0) AS STOFLD2_0,  -- custom lot-ID field; same across locations
-        MIN(ST.STOCOU_0)  AS STOCOU_0,   -- used by QTYSCHED; take first allocation record
-        COALESCE(CAST(STUFF((
-            SELECT DISTINCT ', ' + s2.STOFCY_0
-            FROM   LIVE.STOCK s2
-            WHERE  s2.LOT_0    = ST.LOT_0
-              AND  s2.ITMREF_0 = ST.ITMREF_0
-            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'),
-        1, 2, '') AS VARCHAR(500)), '') AS CURRENTSITE
-    FROM       LIVE.STOCK ST
-    JOIN       lot_filter  LF ON LF.LOT_0 = ST.LOT_0 AND LF.ITMREF_0 = ST.ITMREF_0
-    GROUP BY   ST.LOT_0, ST.ITMREF_0
+        ST.LOT_0,
+        ST.STOCOU_0,           -- keep for SCHED_QTY join
+        SUM(ST.QTYSTU_0) AS TOTAL_QTY
+    FROM LIVE.STOCK ST
+    WHERE ST.LOT_0 IN (SELECT LOT_0 FROM LOTS)
+    GROUP BY
+        ST.ITMREF_0,
+        ST.LOT_0,
+        ST.STOCOU_0
 ),
 
--- ── 3. STOJOU: single scan → all aggregated numeric columns ──────────────────
---    Replaces 9 separate correlated subqueries on STOJOU.
-stojou_agg AS (
+-- STOLOT filtered once
+STOLOT_FILTERED AS (
+    SELECT
+        SL.ITMREF_0,
+        SL.LOT_0,
+        SL.VCRNUM_0,
+        SL.VCRLIN_0,
+        SL.VCRTYP_0,
+        SL.BPSNUM_0
+    FROM LIVE.STOLOT SL
+    WHERE SL.LOT_0 IN (SELECT LOT_0 FROM LOTS)
+),
+
+-- Clean final base to avoid duplicate rows
+LOT_ITEM_BASE AS (
+    SELECT DISTINCT
+        SL.ITMREF_0,
+        SL.LOT_0
+    FROM STOLOT_FILTERED SL
+),
+
+-- Suppliers per lot
+SUPPLIERS AS (
+    SELECT
+        SL.LOT_0,
+        COALESCE(CAST(STUFF((
+            SELECT DISTINCT ', ' + BPS2.BPSNAM_0
+            FROM LIVE.STOLOT SL2
+            LEFT JOIN LIVE.BPSUPPLIER BPS2
+                ON BPS2.BPSNUM_0 = SL2.BPSNUM_0
+            WHERE SL2.LOT_0 = SL.LOT_0
+              AND SL2.BPSNUM_0 <> ''
+              AND LEN(SL2.BPSNUM_0) <> 5
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(500)), '') AS SUPPLIER
+    FROM STOLOT_FILTERED SL
+    GROUP BY SL.LOT_0
+),
+
+-- STOJOU pre-filtered
+STOJOU_BASE AS (
     SELECT
         SJ.LOT_0,
         SJ.ITMREF_0,
-        -- Shipped qty (customer deliveries, VCRTYP_0=4, non-intercompany)
-        -SUM(CASE WHEN SJ.VCRTYP_0 = 4  AND LEN(SJ.BPRNUM_0) <> 5 THEN SJ.QTYSTU_0 ELSE 0 END)  AS SHIPQTY,
-        -- Inventory adjustments
-         SUM(CASE WHEN SJ.VCRTYP_0 IN (19,20)                      THEN SJ.QTYSTU_0 ELSE 0 END)  AS QTYADJ,
-        -- Returns to supplier
-         SUM(CASE WHEN SJ.VCRTYP_0 = 8                             THEN SJ.QTYSTU_0 ELSE 0 END)  AS QTYRETSUPP,
-        -- Purchase invoice cost numerator / denominator (VCRTYP_0=6)
-         SUM(CASE WHEN SJ.VCRTYP_0 = 6                             THEN SJ.VARORD_0  ELSE 0 END) AS varord_rec,
-         SUM(CASE WHEN SJ.VCRTYP_0 = 6                             THEN SJ.QTYSTU_0  ELSE 0 END) AS qty_rec,
-        -- Purchase receipt cost (VCRTYP_0=6, not yet matched to invoice)
-         SUM(CASE WHEN SJ.VCRTYP_0 = 6 AND SJ.VCRNUMREG_0 = ''    THEN SJ.VARORD_0  ELSE 0 END) AS varord_unreg,
-         SUM(CASE WHEN SJ.VCRTYP_0 = 6 AND SJ.VCRNUMREG_0 = ''    THEN SJ.QTYSTU_0  ELSE 0 END) AS qty_unreg
-    FROM       LIVE.STOJOU SJ
-    JOIN       lot_filter   LF ON LF.LOT_0 = SJ.LOT_0 AND LF.ITMREF_0 = SJ.ITMREF_0
-    GROUP BY   SJ.LOT_0, SJ.ITMREF_0
+        SJ.VCRNUM_0,
+        SJ.VCRLIN_0,
+        SJ.VCRTYP_0,
+        SJ.BPRNUM_0,
+        SJ.QTYSTU_0,
+        SJ.VARORD_0,
+        SJ.VCRNUMORI_0,
+        SJ.VCRLINORI_0,
+        SJ.VCRNUMREG_0,
+        SJ.STOFLD2_0
+    FROM LIVE.STOJOU SJ
+    WHERE SJ.LOT_0 IN (SELECT LOT_0 FROM LOTS)
 ),
 
--- ── 4. Supplier names (one pass over STOLOT + BPSUPPLIER) ────────────────────
-supplier_list AS (
+-- STOFLD2 from STOJOU history (not STOCK, which loses it when qty = 0)
+STOFLD2_AGG AS (
     SELECT
-        LF.LOT_0,
+        SJ.LOT_0,
+        SJ.ITMREF_0,
+        MAX(SJ.STOFLD2_0) AS STOFLD2_0
+    FROM STOJOU_BASE SJ
+    WHERE SJ.STOFLD2_0 <> ''
+    GROUP BY
+        SJ.LOT_0,
+        SJ.ITMREF_0
+),
+
+-- Sales orders referencing the lot's STOFLD2_0 via SORDERP.YLOTID_0
+SALES_ORDERS_AGG AS (
+    SELECT
+        SF2.LOT_0,
+        SF2.ITMREF_0,
         COALESCE(CAST(STUFF((
-            SELECT DISTINCT ', ' + BPS.BPSNAM_0
-            FROM   LIVE.STOLOT      SL2
-            JOIN   LIVE.BPSUPPLIER  BPS ON BPS.BPSNUM_0 = SL2.BPSNUM_0
-            WHERE  SL2.LOT_0       = LF.LOT_0
-              AND  SL2.BPSNUM_0   <> ''
-              AND  LEN(SL2.BPSNUM_0) <> 5
-            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'),
-        1, 2, '') AS VARCHAR(500)), '') AS SUPPLIER
-    FROM (SELECT DISTINCT LOT_0 FROM lot_filter) LF
+            SELECT DISTINCT ', ' + SOP.SOHNUM_0
+            FROM LIVE.SORDERP SOP
+            WHERE SOP.YLOTID_0 = SF2.STOFLD2_0
+              AND SOP.YLOTID_0 <> ''
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(1000)), '') AS SALESORDERS
+    FROM STOFLD2_AGG SF2
 ),
 
--- ── 5. Delivery voucher list (FOR XML once per lot, not per outer row) ────────
-delivery_list AS (
+-- Deliveries (vcrtyp=4, non-internal)
+DELIVERIES_AGG AS (
     SELECT
-        LF.LOT_0,
-        LF.ITMREF_0,
+        SJ.ITMREF_0,
+        SJ.LOT_0,
         COALESCE(CAST(STUFF((
             SELECT DISTINCT ', ' + SJ2.VCRNUM_0
-            FROM   LIVE.STOJOU SJ2
-            WHERE  SJ2.LOT_0    = LF.LOT_0
-              AND  SJ2.ITMREF_0 = LF.ITMREF_0
-              AND  SJ2.VCRTYP_0 = 4
-              AND  LEN(SJ2.BPRNUM_0) <> 5
-            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'),
-        1, 2, '') AS VARCHAR(500)), '') AS DELIVERIES
-    FROM lot_filter LF
+            FROM STOJOU_BASE SJ2
+            WHERE SJ2.ITMREF_0 = SJ.ITMREF_0
+              AND SJ2.LOT_0 = SJ.LOT_0
+              AND SJ2.VCRTYP_0 = 4
+              AND LEN(SJ2.BPRNUM_0) <> 5
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(500)), '') AS DELIVERIES,
+        -SUM(SJ.QTYSTU_0) AS SHIPQTY
+    FROM STOJOU_BASE SJ
+    WHERE SJ.VCRTYP_0 = 4
+      AND LEN(SJ.BPRNUM_0) <> 5
+    GROUP BY
+        SJ.ITMREF_0,
+        SJ.LOT_0
 ),
 
--- ── 6. STOLOT receipt entries (VCRTYP_0=6) – filtered once ───────────────────
---    Reused for: RECEIPTNUM, RECEIPTDATE, RECEIPTETA, POLINEQTY, PORECQTY
-stolot_rec AS (
-    SELECT SL.LOT_0, SL.ITMREF_0, SL.VCRNUM_0, SL.VCRLIN_0
-    FROM   LIVE.STOLOT SL
-    JOIN   lot_filter   LF ON LF.LOT_0 = SL.LOT_0
-    WHERE  SL.VCRTYP_0 = 6
-      AND  LEN(SL.BPSNUM_0) <> 5
-),
-
--- ── 7. Receipt header data (dates, ETA) ──────────────────────────────────────
-receipt_data AS (
-    SELECT SR.LOT_0, SR.VCRNUM_0, REC.RCPDAT_0, REC.YRCETA_0
-    FROM   stolot_rec   SR
-    LEFT JOIN LIVE.PRECEIPT REC ON REC.PTHNUM_0 = SR.VCRNUM_0
-),
-
--- ── 8. Receipt aggregations (numbers, dates, ETA) – FOR XML once per lot ─────
-receipt_agg AS (
+-- Receipt journal entries (vcrtyp=6)
+STOJOU_RECEIPTS AS (
     SELECT
-        RD.LOT_0,
-        COALESCE(CAST(STUFF((
-            SELECT DISTINCT ', ' + r2.VCRNUM_0
-            FROM   receipt_data r2
-            WHERE  r2.LOT_0 = RD.LOT_0
-            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'),
-        1, 2, '') AS VARCHAR(500)), '') AS RECEIPTNUM,
-
-        COALESCE(CAST(STUFF((
-            SELECT DISTINCT ', ' + CONVERT(VARCHAR, r2.RCPDAT_0, 101)
-            FROM   receipt_data r2
-            WHERE  r2.LOT_0      = RD.LOT_0
-              AND  r2.RCPDAT_0  IS NOT NULL
-            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'),
-        1, 2, '') AS VARCHAR(500)), '') AS RECEIPTDATE,
-
-        COALESCE(CAST(STUFF((
-            SELECT DISTINCT ', ' + CASE WHEN YEAR(r2.YRCETA_0) < 1900 THEN ''
-                                        ELSE CONVERT(VARCHAR, r2.YRCETA_0, 101) END
-            FROM   receipt_data r2
-            WHERE  r2.LOT_0      = RD.LOT_0
-              AND  r2.YRCETA_0  IS NOT NULL
-            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'),
-        1, 2, '') AS VARCHAR(500)), '') AS RECEIPTETA
-    FROM (SELECT DISTINCT LOT_0 FROM receipt_data) RD
-),
-
--- ── 9. PO base: PORDERQ + STOJOU join (single scan) ─────────────────────────
---    Reused for: PURTYPE, SHIPMENT, CONTETA
-po_base AS (
-    SELECT DISTINCT
         SJ.LOT_0,
         SJ.ITMREF_0,
+        SJ.VCRNUMORI_0,
+        SJ.VCRLINORI_0,
+        SJ.VARORD_0,
+        SJ.QTYSTU_0,
+        SJ.VCRNUMREG_0
+    FROM STOJOU_BASE SJ
+    WHERE SJ.VCRTYP_0 = 6
+),
+
+-- Purchase cost rollups
+PUR_COSTS AS (
+    SELECT
+        LOT_0,
+        SUM(VARORD_0) / NULLIF(SUM(QTYSTU_0), 0) AS PURINVCOST,
+        SUM(CASE WHEN VCRNUMREG_0 = '' THEN VARORD_0 ELSE 0 END)
+            / NULLIF(SUM(CASE WHEN VCRNUMREG_0 = '' THEN QTYSTU_0 ELSE 0 END), 0) AS PURRECCOST
+    FROM STOJOU_RECEIPTS
+    GROUP BY LOT_0
+),
+
+-- PO lines joined to receipt journal
+PO_JOIN AS (
+    SELECT DISTINCT
+        SJ.ITMREF_0,
+        SJ.LOT_0,
         POQ.POHNUM_0,
         POQ.POPLIN_0,
-        POQ.ZPOTYP_0
-    FROM       LIVE.STOJOU  SJ
-    JOIN       lot_filter    LF  ON LF.LOT_0    = SJ.LOT_0  AND LF.ITMREF_0 = SJ.ITMREF_0
-    JOIN       LIVE.PORDERQ  POQ ON POQ.POHNUM_0 = SJ.VCRNUMORI_0 AND POQ.POPLIN_0 = SJ.VCRLINORI_0
+        POQ.ZPOTYP_0,
+        POPL.YRAILCARNUM_0
+    FROM STOJOU_RECEIPTS SJ
+    JOIN LIVE.PORDERQ POQ
+        ON POQ.POHNUM_0 = SJ.VCRNUMORI_0
+       AND POQ.POPLIN_0 = SJ.VCRLINORI_0
+    LEFT JOIN LIVE.PORDERP POPL
+        ON POPL.POHNUM_0 = POQ.POHNUM_0
+       AND POPL.POPLIN_0 = POQ.POPLIN_0
 ),
 
--- ── 10. Shipment details (built from po_base, no extra STOJOU scan) ───────────
-shipment_base AS (
-    SELECT DISTINCT
-        PB.LOT_0,
-        PB.ITMREF_0,
-        SHD.SHIPNUM_0,
-        SH.YETADETPORT_0
-    FROM       po_base       PB
-    JOIN       LIVE.SHIPMENTD SHD ON SHD.POHNUM_0  = PB.POHNUM_0 AND SHD.POPLIN_0 = PB.POPLIN_0
-    JOIN       LIVE.SHIPMENT  SH  ON SH.SHIPNUM_0  = SHD.SHIPNUM_0
-),
-
--- ── 11. PO aggregations (PURTYPE, SHIPMENT, CONTETA) – FOR XML once per lot ──
-po_agg AS (
+PURTYPE_AGG AS (
     SELECT
-        LF.LOT_0,
+        PJ.ITMREF_0,
+        PJ.LOT_0,
         COALESCE(CAST(STUFF((
-            SELECT DISTINCT ', ' + CASE pb.ZPOTYP_0
-                WHEN 1 THEN 'Domestic' WHEN 2 THEN 'International'
-                WHEN 3 THEN 'Import'   WHEN 4 THEN 'Export' END
-            FROM   po_base pb
-            WHERE  pb.LOT_0 = LF.LOT_0
-            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'),
-        1, 2, '') AS VARCHAR(500)), '') AS PURTYPE,
-
-        COALESCE(CAST(STUFF((
-            SELECT DISTINCT ', ' + sb.SHIPNUM_0
-            FROM   shipment_base sb
-            WHERE  sb.LOT_0 = LF.LOT_0
-            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'),
-        1, 2, '') AS VARCHAR(500)), '') AS SHIPMENT,
-
-        COALESCE(CAST(STUFF((
-            SELECT DISTINCT ', ' + CASE WHEN YEAR(sb.YETADETPORT_0) < 1900 THEN ''
-                                        ELSE CONVERT(VARCHAR, sb.YETADETPORT_0, 101) END
-            FROM   shipment_base sb
-            WHERE  sb.LOT_0 = LF.LOT_0
-            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'),
-        1, 2, '') AS VARCHAR(500)), '') AS CONTETA
-    FROM (SELECT DISTINCT LOT_0 FROM lot_filter) LF
+            SELECT DISTINCT ', ' +
+                CASE PJ2.ZPOTYP_0
+                    WHEN 1 THEN 'Domestic'
+                    WHEN 2 THEN 'International'
+                    WHEN 3 THEN 'Import'
+                    WHEN 4 THEN 'Export'
+                END
+            FROM PO_JOIN PJ2
+            WHERE PJ2.ITMREF_0 = PJ.ITMREF_0
+              AND PJ2.LOT_0 = PJ.LOT_0
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(500)), '') AS PURTYPE
+    FROM PO_JOIN PJ
+    GROUP BY
+        PJ.ITMREF_0,
+        PJ.LOT_0
 ),
 
--- ── 12. Rail car numbers (PORDERP – separate table from PORDERQ) ─────────────
-railcar_agg AS (
+RAILCAR_AGG AS (
     SELECT
-        LF.LOT_0,
+        PJ.ITMREF_0,
+        PJ.LOT_0,
         COALESCE(CAST(STUFF((
-            SELECT DISTINCT ', ' + POP.YRAILCARNUM_0
-            FROM   LIVE.STOJOU  SJ2
-            JOIN   LIVE.PORDERP POP ON POP.POHNUM_0 = SJ2.VCRNUMORI_0 AND POP.POPLIN_0 = SJ2.VCRLINORI_0
-            WHERE  SJ2.LOT_0    = LF.LOT_0
-              AND  SJ2.ITMREF_0 = LF.ITMREF_0
-              AND  POP.YRAILCARNUM_0 <> ''
-            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'),
-        1, 2, '') AS VARCHAR(500)), '') AS PORAILCAR
-    FROM lot_filter LF
+            SELECT DISTINCT ', ' + PJ2.YRAILCARNUM_0
+            FROM PO_JOIN PJ2
+            WHERE PJ2.ITMREF_0 = PJ.ITMREF_0
+              AND PJ2.LOT_0 = PJ.LOT_0
+              AND PJ2.YRAILCARNUM_0 IS NOT NULL
+              AND PJ2.YRAILCARNUM_0 <> ''
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(500)), '') AS PORAILCAR
+    FROM PO_JOIN PJ
+    GROUP BY
+        PJ.ITMREF_0,
+        PJ.LOT_0
 ),
 
--- ── 13. Packing cost ──────────────────────────────────────────────────────────
-pack_cost AS (
+-- Shipments via PO
+SHIPMENT_AGG AS (
     SELECT
-        PS.LOT_0,
-        PS.ITMREF_0,
-        SUM(PS.POPERLB + PS.PKGPERLB) AS PACKLPCCOST
-    FROM   LIVE.ZPKGSTOLOT PS
-    JOIN   lot_filter        LF ON LF.LOT_0 = PS.LOT_0 AND LF.ITMREF_0 = PS.ITMREF_0
-    GROUP BY PS.LOT_0, PS.ITMREF_0
+        PJ.ITMREF_0,
+        PJ.LOT_0,
+        COALESCE(CAST(STUFF((
+            SELECT DISTINCT ', ' + SHD2.SHIPNUM_0
+            FROM PO_JOIN PJ2
+            LEFT JOIN LIVE.SHIPMENTD SHD2
+                ON SHD2.POHNUM_0 = PJ2.POHNUM_0
+               AND SHD2.POPLIN_0 = PJ2.POPLIN_0
+            WHERE PJ2.ITMREF_0 = PJ.ITMREF_0
+              AND PJ2.LOT_0 = PJ.LOT_0
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(500)), '') AS SHIPMENT
+    FROM PO_JOIN PJ
+    GROUP BY
+        PJ.ITMREF_0,
+        PJ.LOT_0
 ),
 
--- ── 14. PO line qty + receipt qty (joined in one pass) ───────────────────────
---    Original had two separate scalar subqueries with GROUP BY which would error
---    ("subquery returned more than 1 value") if a lot had more than one PO line.
---    Fixed by removing redundant GROUP BY and summing across all lines.
-po_receipt_qty AS (
+-- Container ETA
+CONT_ETA_AGG AS (
+    SELECT
+        PJ.ITMREF_0,
+        PJ.LOT_0,
+        COALESCE(CAST(STUFF((
+            SELECT DISTINCT ', ' +
+                CASE
+                    WHEN YEAR(SH2.YETADETPORT_0) < 1900 THEN ''
+                    ELSE CONVERT(VARCHAR, SH2.YETADETPORT_0, 101)
+                END
+            FROM PO_JOIN PJ2
+            LEFT JOIN LIVE.SHIPMENTD SHD2
+                ON SHD2.POHNUM_0 = PJ2.POHNUM_0
+               AND SHD2.POPLIN_0 = PJ2.POPLIN_0
+            LEFT JOIN LIVE.SHIPMENT SH2
+                ON SH2.SHIPNUM_0 = SHD2.SHIPNUM_0
+            WHERE PJ2.ITMREF_0 = PJ.ITMREF_0
+              AND PJ2.LOT_0 = PJ.LOT_0
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(500)), '') AS CONTETA
+    FROM PO_JOIN PJ
+    GROUP BY
+        PJ.ITMREF_0,
+        PJ.LOT_0
+),
+
+-- STOLOT receipts joined to PRECEIPT
+STOLOT_RECEIPTS AS (
+    SELECT
+        SL.LOT_0,
+        SL.VCRNUM_0,
+        CONVERT(VARCHAR, REC.RCPDAT_0, 101) AS RECDAT,
+        CASE
+            WHEN YEAR(REC.YRCETA_0) < 1900 THEN ''
+            ELSE CONVERT(VARCHAR, REC.YRCETA_0, 101)
+        END AS ETA
+    FROM STOLOT_FILTERED SL
+    LEFT JOIN LIVE.PRECEIPT REC
+        ON REC.PTHNUM_0 = SL.VCRNUM_0
+    WHERE SL.VCRTYP_0 = 6
+      AND LEN(SL.BPSNUM_0) <> 5
+),
+
+RECEIPT_AGG AS (
     SELECT
         SR.LOT_0,
-        SUM(POQ.QTYSTU_0) AS POLINEQTY,
-        SUM(RD.QTYSTU_0)  AS PORECQTY
-    FROM       stolot_rec    SR
-    LEFT JOIN  LIVE.PRECEIPTD RD  ON RD.PTHNUM_0 = SR.VCRNUM_0 AND RD.PTDLIN_0 = SR.VCRLIN_0
-    LEFT JOIN  LIVE.PORDERQ   POQ ON POQ.POHNUM_0 = RD.POHNUM_0 AND POQ.POPLIN_0 = RD.POPLIN_0
-    GROUP BY   SR.LOT_0
+        COALESCE(CAST(STUFF((
+            SELECT DISTINCT ', ' + SR2.VCRNUM_0
+            FROM STOLOT_RECEIPTS SR2
+            WHERE SR2.LOT_0 = SR.LOT_0
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(500)), '') AS RECEIPTNUM,
+        COALESCE(CAST(STUFF((
+            SELECT DISTINCT ', ' + SR2.RECDAT
+            FROM STOLOT_RECEIPTS SR2
+            WHERE SR2.LOT_0 = SR.LOT_0
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(500)), '') AS RECEIPTDATE,
+        COALESCE(CAST(STUFF((
+            SELECT DISTINCT ', ' + SR2.ETA
+            FROM STOLOT_RECEIPTS SR2
+            WHERE SR2.LOT_0 = SR.LOT_0
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(500)), '') AS RECEIPTETA
+    FROM STOLOT_RECEIPTS SR
+    GROUP BY SR.LOT_0
 ),
 
--- ── 15. SINVOICED: single scan → QTYINV + AMTINV ────────────────────────────
-invoice_agg AS (
+-- Pack cost per lot+item
+PACK_COST AS (
     SELECT
-        SJ.LOT_0,
-        SJ.ITMREF_0,
-        SUM(SID.QTYSTU_0)            AS QTYINV,
-        SUM(SID.QTY_0 * SID.NETPRI_0) AS AMTINV
-    FROM   LIVE.STOJOU    SJ
-    JOIN   lot_filter      LF  ON LF.LOT_0    = SJ.LOT_0 AND LF.ITMREF_0 = SJ.ITMREF_0
-    JOIN   LIVE.SINVOICED  SID ON SID.SDHNUM_0 = SJ.VCRNUM_0 AND SID.SDDLIN_0 = SJ.VCRLIN_0
-    GROUP BY SJ.LOT_0, SJ.ITMREF_0
+        ITMREF_0,
+        LOT_0,
+        COALESCE(SUM(POPERLB + PKGPERLB), 0) AS PACKLPCCOST
+    FROM LIVE.ZPKGSTOLOT
+    WHERE LOT_0 IN (SELECT LOT_0 FROM LOTS)
+    GROUP BY
+        ITMREF_0,
+        LOT_0
 ),
 
--- ── 16. Sales orders: single scan → QTYSOLD (used for both QTYSOLD/QTYUNSOLD) ─
-sales_agg AS (
+-- PO line qty via receipt
+PO_LINE_QTY AS (
+    SELECT
+        SL.LOT_0,
+        SUM(POQ.QTYSTU_0) AS POLINEQTY
+    FROM STOLOT_FILTERED SL
+    LEFT JOIN LIVE.PRECEIPTD RD
+        ON SL.VCRNUM_0 = RD.PTHNUM_0
+       AND SL.VCRLIN_0 = RD.PTDLIN_0
+    JOIN LIVE.PORDERQ POQ
+        ON POQ.POHNUM_0 = RD.POHNUM_0
+       AND POQ.POPLIN_0 = RD.POPLIN_0
+    WHERE SL.VCRTYP_0 = 6
+      AND LEN(SL.BPSNUM_0) <> 5
+    GROUP BY SL.LOT_0
+),
+
+-- Receipt qty
+PO_REC_QTY AS (
+    SELECT
+        SL.LOT_0,
+        SUM(RD.QTYSTU_0) AS PORECQTY
+    FROM STOLOT_FILTERED SL
+    LEFT JOIN LIVE.PRECEIPTD RD
+        ON SL.VCRNUM_0 = RD.PTHNUM_0
+       AND SL.VCRLIN_0 = RD.PTDLIN_0
+    WHERE SL.VCRTYP_0 = 6
+      AND LEN(SL.BPSNUM_0) <> 5
+    GROUP BY SL.LOT_0
+),
+
+-- Qty adjustments (vcrtyp 19/20)
+QTY_ADJ AS (
+    SELECT
+        LOT_0,
+        SUM(QTYSTU_0) AS QTYADJ
+    FROM STOJOU_BASE
+    WHERE VCRTYP_0 IN (19, 20)
+    GROUP BY LOT_0
+),
+
+-- Sold qty via sales orders
+SALES_AGG AS (
     SELECT
         ST1.LOT_0,
         SUM(SOQ.QTYSTU_0) AS QTYSOLD
-    FROM       LIVE.SORDERQ  SOQ
-    JOIN       LIVE.SORDERP  SOP ON SOP.SOHNUM_0  = SOQ.SOHNUM_0 AND SOP.SOPLIN_0 = SOQ.SOPLIN_0
-    JOIN       LIVE.STOCK    ST1 ON ST1.STOFLD2_0  = SOP.YLOTID_0
-    JOIN       lot_filter     LF  ON LF.LOT_0      = ST1.LOT_0
-    WHERE      SOQ.SOQSEQ_0 <> 3
-    GROUP BY   ST1.LOT_0
+    FROM LIVE.SORDERQ SOQ
+    JOIN LIVE.SORDERP SOP
+        ON SOP.SOHNUM_0 = SOQ.SOHNUM_0
+       AND SOP.SOPLIN_0 = SOQ.SOPLIN_0
+    JOIN LIVE.STOCK ST1
+        ON ST1.STOFLD2_0 = SOP.YLOTID_0
+    WHERE SOQ.SOQSEQ_0 <> 3
+      AND ST1.LOT_0 IN (SELECT LOT_0 FROM LOTS)
+    GROUP BY ST1.LOT_0
 ),
 
--- ── 17. Scheduled qty (STOALL) ───────────────────────────────────────────────
-sched_agg AS (
+-- Scheduled qty
+SCHED_QTY AS (
     SELECT
         SA.STOCOU_0,
         SUM(SA.QTYSTU_0) AS QTYSCHED
-    FROM   LIVE.STOALL SA
+    FROM LIVE.STOALL SA
+    WHERE SA.STOCOU_0 IN (SELECT STOCOU_0 FROM STOCK_AGG)
     GROUP BY SA.STOCOU_0
+),
+
+-- Invoiced qty, amount, invoice numbers, and customer names
+INV_AGG AS (
+    SELECT
+        SJ.LOT_0,
+        SJ.ITMREF_0,
+        SUM(SID.QTYSTU_0) AS QTYINV,
+        SUM(SID.QTY_0 * SID.NETPRI_0) AS AMTINV,
+        SUM(SID.QTY_0 * SID.CPRPRI_0) AS CSTINV,
+
+        COALESCE(CAST(STUFF((
+            SELECT DISTINCT ', ' + SID2.NUM_0
+            FROM STOJOU_BASE SJ2
+            JOIN LIVE.SINVOICED SID2
+                ON SID2.SDHNUM_0 = SJ2.VCRNUM_0
+               AND SID2.SDDLIN_0 = SJ2.VCRLIN_0
+            WHERE SJ2.LOT_0 = SJ.LOT_0
+              AND SJ2.ITMREF_0 = SJ.ITMREF_0
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(1000)), '') AS INVNUMBERS,
+
+        COALESCE(CAST(STUFF((
+            SELECT DISTINCT '/ ' + SI2.BPYNAM_0
+            FROM STOJOU_BASE SJ2
+            JOIN LIVE.SINVOICED SID2
+                ON SID2.SDHNUM_0 = SJ2.VCRNUM_0
+               AND SID2.SDDLIN_0 = SJ2.VCRLIN_0
+            JOIN LIVE.SINVOICE SI2
+                ON SI2.NUM_0 = SID2.NUM_0
+            WHERE SJ2.LOT_0 = SJ.LOT_0
+              AND SJ2.ITMREF_0 = SJ.ITMREF_0
+              AND SI2.BPYNAM_0 <> ''
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(1000)), '') AS CUSTOMERNAMES
+
+    FROM STOJOU_BASE SJ
+    JOIN LIVE.SINVOICED SID
+        ON SID.SDHNUM_0 = SJ.VCRNUM_0
+       AND SID.SDDLIN_0 = SJ.VCRLIN_0
+    GROUP BY
+        SJ.LOT_0,
+        SJ.ITMREF_0
+),
+
+-- Return to supplier (vcrtyp=8)
+RET_SUPP AS (
+    SELECT
+        LOT_0,
+        SUM(QTYSTU_0) AS QTYRETSUPP
+    FROM STOJOU_BASE
+    WHERE VCRTYP_0 = 8
+    GROUP BY LOT_0
+),
+
+-- Customer returns (vcrtyp=13)
+RET_CUST AS (
+    SELECT
+        LOT_0,
+        SUM(QTYSTU_0) AS QTYRETCUST
+    FROM STOJOU_BASE
+    WHERE VCRTYP_0 = 13
+    GROUP BY LOT_0
+),
+
+-- Current sites per lot+item
+CURRENTSITE_AGG AS (
+    SELECT
+        ST.ITMREF_0,
+        ST.LOT_0,
+        COALESCE(CAST(STUFF((
+            SELECT DISTINCT ', ' + ST2.STOFCY_0
+            FROM LIVE.STOCK ST2
+            WHERE ST2.ITMREF_0 = ST.ITMREF_0
+              AND ST2.LOT_0 = ST.LOT_0
+            FOR XML PATH('')
+        ), 1, 2, '') AS VARCHAR(500)), '') AS CURRENTSITE
+    FROM LIVE.STOCK ST
+    WHERE ST.LOT_0 IN (SELECT LOT_0 FROM LOTS)
+    GROUP BY
+        ST.ITMREF_0,
+        ST.LOT_0
+),
+
+-- ── Supplier invoice total (invoices + credit memos + debit memos) ────────────
+-- STOJOU_RECEIPTS.VCRNUMREG_0 is the AP invoice that matched each receipt.
+-- PINVOICE.SNS_0 carries the accounting sign, so credit memos automatically
+-- subtract and debit memos add, giving a signed net total per lot.
+LOT_SUPP_INV AS (
+    SELECT
+        SR.LOT_0,
+        SUM(PI.SNS_0 * PI.AMTNOTATI_0) AS SUPPINVTOT
+    FROM (
+        SELECT DISTINCT LOT_0, VCRNUMREG_0
+        FROM   STOJOU_RECEIPTS
+        WHERE  VCRNUMREG_0 <> ''
+    ) SR
+    JOIN LIVE.PINVOICE PI ON PI.NUM_0 = SR.VCRNUMREG_0
+    GROUP BY SR.LOT_0
+),
+
+-- Inbound accruals: sum AR/QR by receipt line first, then roll to PO
+PO_ACCRUALS_BY_RECEIPT AS (
+    SELECT
+        RD.POHNUM_0,
+        AH.VCRNUM_0 AS PTHNUM_0,
+        AH.VCRLIN_0 AS PTDLIN_0,
+        AD.ECATYP_0 AS ACCRUAL_0,
+        SUM(AD.ARATAMT_0) AS SUM_ARATAMT,
+        SUM(AD.QRATAMT_0) AS SUM_QRATAMT
+    FROM LIVE.YECAH AH
+    JOIN LIVE.YECAD AD
+        ON AD.YECAID_0 = AH.YECAID_0
+    JOIN LIVE.PRECEIPTD RD
+        ON RD.PTHNUM_0 = AH.VCRNUM_0
+       AND RD.PTDLIN_0 = AH.VCRLIN_0
+    WHERE AH.VCRTYP_0 = 6
+      AND AH.VCRNUM_0 LIKE 'REC%'
+      AND AH.YECAID_0 <> 0
+      AND AD.YECAID_0 <> 0
+      AND AD.ECATYP_0 IN (
+            'INFRDRAY','INFRRAIL','INFRTL','INFRBT','INDEM',
+            'INTERM','INBROKER','BOLIN','MISCIN','INFRCHA','INFROCEAN'
+      )
+    GROUP BY
+        RD.POHNUM_0,
+        AH.VCRNUM_0,
+        AH.VCRLIN_0,
+        AD.ECATYP_0
+),
+
+PO_ACCRUALS AS (
+    SELECT
+        PAR.POHNUM_0,
+        PAR.ACCRUAL_0,
+        SUM(CASE WHEN PAR.SUM_ARATAMT = 0 THEN PAR.SUM_QRATAMT ELSE PAR.SUM_ARATAMT END) AS ACCRUAL_AMT
+    FROM PO_ACCRUALS_BY_RECEIPT PAR
+    GROUP BY
+        PAR.POHNUM_0,
+        PAR.ACCRUAL_0
+),
+
+PO_RECEIPT_QTY AS (
+    SELECT
+        RD.POHNUM_0,
+        SUM(RD.QTYSTU_0) AS PORECQTY
+    FROM LIVE.PRECEIPTD RD
+    GROUP BY RD.POHNUM_0
+),
+
+LOT_RECEIPT_QTY AS (
+    SELECT
+        RD.POHNUM_0,
+        SL.LOT_0,
+        SUM(RD.QTYSTU_0) AS LOTRECQTY
+    FROM LIVE.PRECEIPTD RD
+    JOIN LIVE.STOLOT SL
+        ON SL.VCRNUM_0 = RD.PTHNUM_0
+       AND SL.VCRLIN_0 = RD.PTDLIN_0
+       AND SL.VCRTYP_0 = 6
+    WHERE SL.LOT_0 <> ''
+      AND SL.LOT_0 IN (SELECT LOT_0 FROM LOTS)
+    GROUP BY
+        RD.POHNUM_0,
+        SL.LOT_0
+),
+
+LOT_ACCRUALS AS (
+    SELECT
+        LR.LOT_0,
+        SUM(CASE WHEN PA.ACCRUAL_0 = 'INFRDRAY'  THEN PA.ACCRUAL_AMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS INFRDRAY,
+        SUM(CASE WHEN PA.ACCRUAL_0 = 'INFRRAIL'  THEN PA.ACCRUAL_AMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS INFRRAIL,
+        SUM(CASE WHEN PA.ACCRUAL_0 = 'INFRTL'    THEN PA.ACCRUAL_AMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS INFRTL,
+        SUM(CASE WHEN PA.ACCRUAL_0 = 'INFRBT'    THEN PA.ACCRUAL_AMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS INFRBT,
+        SUM(CASE WHEN PA.ACCRUAL_0 = 'INDEM'     THEN PA.ACCRUAL_AMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS INDEM,
+        SUM(CASE WHEN PA.ACCRUAL_0 = 'INTERM'    THEN PA.ACCRUAL_AMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS INTERM,
+        SUM(CASE WHEN PA.ACCRUAL_0 = 'INBROKER'  THEN PA.ACCRUAL_AMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS INBROKER,
+        SUM(CASE WHEN PA.ACCRUAL_0 = 'BOLIN'     THEN PA.ACCRUAL_AMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS BOLIN,
+        SUM(CASE WHEN PA.ACCRUAL_0 = 'MISCIN'    THEN PA.ACCRUAL_AMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS MISCIN,
+        SUM(CASE WHEN PA.ACCRUAL_0 = 'INFRCHA'   THEN PA.ACCRUAL_AMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS INFRCHA,
+        SUM(CASE WHEN PA.ACCRUAL_0 = 'INFROCEAN' THEN PA.ACCRUAL_AMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS INFROCEAN
+    FROM LOT_RECEIPT_QTY LR
+    JOIN PO_RECEIPT_QTY PR
+        ON PR.POHNUM_0 = LR.POHNUM_0
+    JOIN PO_ACCRUALS PA
+        ON PA.POHNUM_0 = LR.POHNUM_0
+    GROUP BY LR.LOT_0
+),
+
+PO_ACTUALS AS (
+    SELECT
+        GD.ACC_0,
+        ID.ZPOHNUM_0 AS POHNUM_0,
+        SUM(GD.SNS_0 * GD.AMTLED_0) AS ACTAMT
+    FROM LIVE.GACCENTRYD GD
+    JOIN LIVE.BPSINVLIG ID
+        ON GD.NUM_0 = ID.NUM_0
+       AND GD.ACC_0 = ID.ACC_0
+       AND GD.FREREF_0 LIKE CONCAT('%', ID.ZPOHNUM_0, '%')
+    WHERE GD.ACC_0 IN (
+            '51102','51103','51104','51105','51107',
+            '51108','51109','51111','51120','51122'
+        )
+      AND ID.ACC_0 IN (
+            '51102','51103','51104','51105','51107',
+            '51108','51109','51111','51120','51122'
+        )
+      AND ID.ZPOHNUM_0 <> ''
+    GROUP BY
+        GD.ACC_0,
+        ID.ZPOHNUM_0
+),
+
+LOT_INBOUND_ACTUALS AS (
+    SELECT
+        LR.LOT_0,
+        SUM(CASE WHEN PA.ACC_0 = '51104' THEN PA.ACTAMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS ACC_51104,
+        SUM(CASE WHEN PA.ACC_0 = '51107' THEN PA.ACTAMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS ACC_51107,
+        SUM(CASE WHEN PA.ACC_0 = '51105' THEN PA.ACTAMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS ACC_51105,
+        SUM(CASE WHEN PA.ACC_0 = '51108' THEN PA.ACTAMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS ACC_51108,
+        SUM(CASE WHEN PA.ACC_0 = '51109' THEN PA.ACTAMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS ACC_51109,
+        SUM(CASE WHEN PA.ACC_0 = '51103' THEN PA.ACTAMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS ACC_51103,
+        SUM(CASE WHEN PA.ACC_0 = '51120' THEN PA.ACTAMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS ACC_51120,
+        SUM(CASE WHEN PA.ACC_0 = '51111' THEN PA.ACTAMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS ACC_51111,
+        SUM(CASE WHEN PA.ACC_0 = '51102' THEN PA.ACTAMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS ACC_51102,
+        SUM(CASE WHEN PA.ACC_0 = '51122' THEN PA.ACTAMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS ACC_51122,
+        SUM(CASE WHEN PA.ACC_0 = '60110' THEN PA.ACTAMT * LR.LOTRECQTY / NULLIF(PR.PORECQTY,0) ELSE 0 END) AS ACC_60110
+    FROM LOT_RECEIPT_QTY LR
+    JOIN PO_RECEIPT_QTY PR
+        ON PR.POHNUM_0 = LR.POHNUM_0
+    JOIN PO_ACTUALS PA
+        ON PA.POHNUM_0 = LR.POHNUM_0
+    GROUP BY
+        LR.LOT_0
+),
+
+-- Outbound shipped lot lines
+OUTBOUND_DELIVERY_LINES AS (
+    SELECT
+        SJ.LOT_0,
+        SJ.ITMREF_0,
+        SJ.VCRNUM_0 AS SDHNUM_0,
+        SJ.VCRLIN_0 AS SDDLIN_0,
+        SUM(-SJ.QTYSTU_0) AS SHIPQTY
+    FROM STOJOU_BASE SJ
+    WHERE SJ.VCRTYP_0 = 4
+      AND LEN(SJ.BPRNUM_0) <> 5
+    GROUP BY
+        SJ.LOT_0,
+        SJ.ITMREF_0,
+        SJ.VCRNUM_0,
+        SJ.VCRLIN_0
+),
+
+-- Invoiced outbound: all invoice lines by lot
+OUTBOUND_INVOICE_LINES AS (
+    SELECT
+        DL.LOT_0,
+        DL.ITMREF_0,
+        SID.NUM_0,
+        SID.SDHNUM_0,
+        SID.SDDLIN_0,
+        SUM(SID.QTYSTU_0) AS LINEQTY
+    FROM OUTBOUND_DELIVERY_LINES DL
+    JOIN LIVE.SINVOICED SID
+        ON SID.SDHNUM_0 = DL.SDHNUM_0
+       AND SID.SDDLIN_0 = DL.SDDLIN_0
+    GROUP BY
+        DL.LOT_0,
+        DL.ITMREF_0,
+        SID.NUM_0,
+        SID.SDHNUM_0,
+        SID.SDDLIN_0
+),
+
+-- Total qty across all lines on the invoice
+OUTBOUND_INVOICE_TOTAL_QTY AS (
+    SELECT
+        OIL.NUM_0,
+        SUM(OIL.LINEQTY) AS TOTAL_INV_QTY
+    FROM OUTBOUND_INVOICE_LINES OIL
+    GROUP BY OIL.NUM_0
+),
+
+-- Find invoice-level accrual YECAIDs (typically only on first line)
+OUTBOUND_INVOICE_ACCRUAL_LINK AS (
+    SELECT DISTINCT
+        SID.NUM_0,
+        SID.YECAID_0
+    FROM LIVE.SINVOICED SID
+    WHERE SID.YECAID_0 IS NOT NULL
+      AND SID.YECAID_0 <> 0
+),
+
+-- Sum outbound accruals by invoice, using invoice's accrual-bearing YECAID(s)
+OUTBOUND_INVOICE_ACCRUAL_TOTALS AS (
+    SELECT
+        OIAL.NUM_0,
+        AD.ECATYP_0 AS ACCRUAL_0,
+        SUM(AD.ARATAMT_0) AS SUM_ARATAMT,
+        SUM(AD.QRATAMT_0) AS SUM_QRATAMT
+    FROM OUTBOUND_INVOICE_ACCRUAL_LINK OIAL
+    JOIN LIVE.YECAD AD
+        ON AD.YECAID_0 = OIAL.YECAID_0
+    WHERE AD.YECAID_0 <> 0
+      AND AD.ECATYP_0 IN (
+        'WARETRAN','OUTFROCEAN','OUTFROCED','OUTFRDRAY','OUTFRTL',
+        'OUTFRBT','OUTFRRAIL','OUTBROKER','BOLOUT','MISCOUT',
+        'OUTFROCEDN','OUTFRDRAYN','OUTFRCHA'
+      )
+    GROUP BY
+        OIAL.NUM_0,
+        AD.ECATYP_0
+),
+
+-- Allocate invoice accruals across all invoice lines by invoice qty
+OUTBOUND_INVOICE_ACCRUALS AS (
+    SELECT
+        OIL.LOT_0,
+        OIL.ITMREF_0,
+        OIL.SDHNUM_0,
+        OIL.SDDLIN_0,
+        OIAT.ACCRUAL_0,
+        CASE
+            WHEN COALESCE(OITQ.TOTAL_INV_QTY, 0) = 0 THEN 0
+            ELSE
+                (CASE WHEN OIAT.SUM_ARATAMT = 0 THEN OIAT.SUM_QRATAMT ELSE OIAT.SUM_ARATAMT END)
+                * (OIL.LINEQTY / OITQ.TOTAL_INV_QTY)
+        END AS ACCAMT_0
+    FROM OUTBOUND_INVOICE_LINES OIL
+    JOIN OUTBOUND_INVOICE_TOTAL_QTY OITQ
+        ON OITQ.NUM_0 = OIL.NUM_0
+    JOIN OUTBOUND_INVOICE_ACCRUAL_TOTALS OIAT
+        ON OIAT.NUM_0 = OIL.NUM_0
+),
+
+-- Uninvoiced outbound delivery lines with YECAID
+OUTBOUND_UNINVOICED_LINES AS (
+    SELECT
+        DL.LOT_0,
+        DL.ITMREF_0,
+        DL.SDHNUM_0,
+        DL.SDDLIN_0,
+        DL.SHIPQTY AS LINEQTY,
+        SDD.YECAID_0
+    FROM OUTBOUND_DELIVERY_LINES DL
+    JOIN LIVE.SDELIVERYD SDD
+        ON SDD.SDHNUM_0 = DL.SDHNUM_0
+       AND SDD.SDDLIN_0 = DL.SDDLIN_0
+    WHERE SDD.YECAID_0 <> 0
+      AND NOT EXISTS (
+          SELECT 1
+          FROM LIVE.SINVOICED SID
+          WHERE SID.SDHNUM_0 = DL.SDHNUM_0
+            AND SID.SDDLIN_0 = DL.SDDLIN_0
+      )
+),
+
+-- Total qty across all delivery lines sharing the same delivery YECAID
+OUTBOUND_UNINVOICED_TOTAL_QTY AS (
+    SELECT
+        OUL.YECAID_0,
+        SUM(OUL.LINEQTY) AS TOTAL_DEL_QTY
+    FROM OUTBOUND_UNINVOICED_LINES OUL
+    GROUP BY OUL.YECAID_0
+),
+
+-- Sum outbound accruals by delivery YECAID
+OUTBOUND_UNINVOICED_ACCRUAL_TOTALS AS (
+    SELECT
+        AD.YECAID_0,
+        AD.ECATYP_0 AS ACCRUAL_0,
+        SUM(AD.ARATAMT_0) AS SUM_ARATAMT,
+        SUM(AD.QRATAMT_0) AS SUM_QRATAMT
+    FROM LIVE.YECAD AD
+    WHERE AD.YECAID_0 <> 0
+      AND AD.ECATYP_0 IN (
+        'WARETRAN','OUTFROCEAN','OUTFROCED','OUTFRDRAY','OUTFRTL',
+        'OUTFRBT','OUTFRRAIL','OUTBROKER','BOLOUT','MISCOUT',
+        'OUTFROCEDN','OUTFRDRAYN','OUTFRCHA'
+      )
+    GROUP BY
+        AD.YECAID_0,
+        AD.ECATYP_0
+),
+
+-- Allocate uninvoiced delivery accruals across delivery lines by qty
+OUTBOUND_UNINVOICED_ACCRUALS AS (
+    SELECT
+        OUL.LOT_0,
+        OUL.ITMREF_0,
+        OUL.SDHNUM_0,
+        OUL.SDDLIN_0,
+        OUAT.ACCRUAL_0,
+        CASE
+            WHEN COALESCE(OUTQ.TOTAL_DEL_QTY, 0) = 0 THEN 0
+            ELSE
+                (CASE WHEN OUAT.SUM_ARATAMT = 0 THEN OUAT.SUM_QRATAMT ELSE OUAT.SUM_ARATAMT END)
+                * (OUL.LINEQTY / OUTQ.TOTAL_DEL_QTY)
+        END AS ACCAMT_0
+    FROM OUTBOUND_UNINVOICED_LINES OUL
+    JOIN OUTBOUND_UNINVOICED_TOTAL_QTY OUTQ
+        ON OUTQ.YECAID_0 = OUL.YECAID_0
+    JOIN OUTBOUND_UNINVOICED_ACCRUAL_TOTALS OUAT
+        ON OUAT.YECAID_0 = OUL.YECAID_0
+),
+
+OUTBOUND_ACCRUAL_LINES AS (
+    SELECT * FROM OUTBOUND_INVOICE_ACCRUALS
+    UNION ALL
+    SELECT * FROM OUTBOUND_UNINVOICED_ACCRUALS
+),
+
+LOT_OUTBOUND_ACCRUALS AS (
+    SELECT
+        OAL.LOT_0,
+        OAL.ITMREF_0,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'WARETRAN'   THEN OAL.ACCAMT_0 ELSE 0 END) AS WARETRAN,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'OUTFROCEAN' THEN OAL.ACCAMT_0 ELSE 0 END) AS OUTFROCEAN,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'OUTFROCED'  THEN OAL.ACCAMT_0 ELSE 0 END) AS OUTFROCED,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'OUTFRDRAY'  THEN OAL.ACCAMT_0 ELSE 0 END) AS OUTFRDRAY,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'OUTFRTL'    THEN OAL.ACCAMT_0 ELSE 0 END) AS OUTFRTL,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'OUTFRBT'    THEN OAL.ACCAMT_0 ELSE 0 END) AS OUTFRBT,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'OUTFRRAIL'  THEN OAL.ACCAMT_0 ELSE 0 END) AS OUTFRRAIL,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'OUTBROKER'  THEN OAL.ACCAMT_0 ELSE 0 END) AS OUTBROKER,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'BOLOUT'     THEN OAL.ACCAMT_0 ELSE 0 END) AS BOLOUT,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'MISCOUT'    THEN OAL.ACCAMT_0 ELSE 0 END) AS MISCOUT,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'OUTFROCEDN' THEN OAL.ACCAMT_0 ELSE 0 END) AS OUTFROCEDN,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'OUTFRDRAYN' THEN OAL.ACCAMT_0 ELSE 0 END) AS OUTFRDRAYN,
+        SUM(CASE WHEN OAL.ACCRUAL_0 = 'OUTFRCHA'   THEN OAL.ACCAMT_0 ELSE 0 END) AS OUTFRCHA
+    FROM OUTBOUND_ACCRUAL_LINES OAL
+    GROUP BY
+        OAL.LOT_0,
+        OAL.ITMREF_0
+),
+
+OUTBOUND_ACTUALS_BY_INV AS (
+    SELECT
+        ACL.INV_0,
+        SUM(CASE WHEN ACCT_0 = '51106' THEN ACTAMT_0 ELSE 0 END) AS ACCT_51106,
+        SUM(CASE WHEN ACCT_0 = '60002' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60002,
+        SUM(CASE WHEN ACCT_0 = '60003' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60003,
+        SUM(CASE WHEN ACCT_0 = '60005' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60005,
+        SUM(CASE WHEN ACCT_0 = '60006' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60006,
+        SUM(CASE WHEN ACCT_0 = '60004' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60004,
+        SUM(CASE WHEN ACCT_0 = '60001' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60001,
+        SUM(CASE WHEN ACCT_0 = '60009' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60009,
+        SUM(CASE WHEN ACCT_0 = '60008' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60008,
+        SUM(CASE WHEN ACCT_0 = '60010' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60010,
+        SUM(CASE WHEN ACCT_0 = '60011' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60011,
+        SUM(CASE WHEN ACCT_0 = '60012' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60012,
+        SUM(CASE WHEN ACCT_0 = '60013' THEN ACTAMT_0 ELSE 0 END) AS ACCT_60013
+    FROM LIVE.ZACTUALS ACL
+    WHERE ACCT_0 IN (
+        '51106','60002','60003','60005','60006','60004',
+        '60001','60009','60008','60010','60011','60012','60013'
+    )
+    GROUP BY ACL.INV_0
+),
+
+OUTBOUND_ACTUAL_INVOICE_LINES AS (
+    SELECT
+        DL.LOT_0,
+        DL.ITMREF_0,
+        SID.NUM_0 AS INV_0,
+        SID.SDHNUM_0,
+        SID.SDDLIN_0,
+        SUM(SID.QTYSTU_0) AS LINEQTY
+    FROM OUTBOUND_DELIVERY_LINES DL
+    JOIN LIVE.SINVOICED SID
+        ON SID.SDHNUM_0 = DL.SDHNUM_0
+       AND SID.SDDLIN_0 = DL.SDDLIN_0
+    JOIN LIVE.ITMMASTER ITM
+        ON ITM.ITMREF_0 = SID.ITMREF_0
+    WHERE ITM.TCLCOD_0 <> 'MGIMC'
+    GROUP BY
+        DL.LOT_0,
+        DL.ITMREF_0,
+        SID.NUM_0,
+        SID.SDHNUM_0,
+        SID.SDDLIN_0
+),
+
+OUTBOUND_ACTUAL_INV_QTY AS (
+    SELECT
+        OAIL.INV_0,
+        SUM(OAIL.LINEQTY) AS TOTAL_INV_QTY
+    FROM OUTBOUND_ACTUAL_INVOICE_LINES OAIL
+    GROUP BY OAIL.INV_0
+),
+
+LOT_OUTBOUND_ACTUALS AS (
+    SELECT
+        OAIL.LOT_0,
+        OAIL.ITMREF_0,
+        SUM(COALESCE(OABI.ACCT_51106,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_51106,
+        SUM(COALESCE(OABI.ACCT_60002,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60002,
+        SUM(COALESCE(OABI.ACCT_60003,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60003,
+        SUM(COALESCE(OABI.ACCT_60005,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60005,
+        SUM(COALESCE(OABI.ACCT_60006,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60006,
+        SUM(COALESCE(OABI.ACCT_60004,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60004,
+        SUM(COALESCE(OABI.ACCT_60001,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60001,
+        SUM(COALESCE(OABI.ACCT_60009,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60009,
+        SUM(COALESCE(OABI.ACCT_60008,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60008,
+        SUM(COALESCE(OABI.ACCT_60010,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60010,
+        SUM(COALESCE(OABI.ACCT_60011,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60011,
+        SUM(COALESCE(OABI.ACCT_60012,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60012,
+        SUM(COALESCE(OABI.ACCT_60013,0) * OAIL.LINEQTY / NULLIF(OAQ.TOTAL_INV_QTY,0)) AS ACCT_60013
+    FROM OUTBOUND_ACTUAL_INVOICE_LINES OAIL
+    JOIN OUTBOUND_ACTUALS_BY_INV OABI ON OABI.INV_0 = OAIL.INV_0
+    JOIN OUTBOUND_ACTUAL_INV_QTY OAQ  ON OAQ.INV_0  = OAIL.INV_0
+    GROUP BY
+        OAIL.LOT_0,
+        OAIL.ITMREF_0
 )
 
--- ── Final SELECT ──────────────────────────────────────────────────────────────
 SELECT
-    LF.ITMREF_0,
-    LF.LOT_0,
-    SA_ST.STOFLD2_0,
-
-    SUP.SUPPLIER,
-    DL.DELIVERIES,
-    COALESCE(SJA.SHIPQTY,    0)                                         AS SHIPQTY,
-    SA_ST.CURRENTSITE,
-    PA.PURTYPE,
-    PA.SHIPMENT,
-    RA.PORAILCAR,
-    RA2.RECEIPTNUM,
-    RA2.RECEIPTDATE,
-    RA2.RECEIPTETA,
-    PA.CONTETA,
-
-    -- Cost per lb: purchase invoice cost / purchase receipt cost
-    CASE WHEN NULLIF(SJA.qty_rec,    0) IS NOT NULL THEN SJA.varord_rec    / SJA.qty_rec    END AS PURINVCOST,
-    CASE WHEN NULLIF(SJA.qty_unreg,  0) IS NOT NULL THEN SJA.varord_unreg  / SJA.qty_unreg  END AS PURRECCOST,
-
-    COALESCE(PC.PACKLPCCOST, 0)                                         AS PACKLPCCOST,
-    PRQ.POLINEQTY,
+    SL.ITMREF_0,
+    SL.LOT_0,
+    COALESCE(SF2.STOFLD2_0, '')     AS STOFLD2_0,
+    COALESCE(SUP.SUPPLIER, '')      AS SUPPLIER,
+    COALESCE(DEL.DELIVERIES, '')    AS DELIVERIES,
+    COALESCE(DEL.SHIPQTY, 0)        AS SHIPQTY,
+    COALESCE(CS.CURRENTSITE, '')    AS CURRENTSITE,
+    COALESCE(PT.PURTYPE, '')        AS PURTYPE,
+    COALESCE(SHM.SHIPMENT, '')      AS SHIPMENT,
+    COALESCE(RC.PORAILCAR, '')      AS PORAILCAR,
+    COALESCE(RA.RECEIPTNUM, '')     AS RECEIPTNUM,
+    COALESCE(RA.RECEIPTDATE, '')    AS RECEIPTDATE,
+    COALESCE(RA.RECEIPTETA, '')     AS RECEIPTETA,
+    COALESCE(CE.CONTETA, '')        AS CONTETA,
+    PC.PURINVCOST,
+    PC.PURRECCOST,
+    COALESCE(PAK.PACKLPCCOST, 0)   AS PACKLPCCOST,
+    PLQ.POLINEQTY,
     PRQ.PORECQTY,
-    COALESCE(SJA.QTYADJ,     0)                                         AS QTYADJ,
+    COALESCE(QA.QTYADJ, 0)         AS QTYADJ,
+    SA.TOTAL_QTY                    AS QOHLBS,
+    CASE WHEN SA.TOTAL_QTY > 0
+         THEN SA.TOTAL_QTY - COALESCE(SALES.QTYSOLD, 0)
+         ELSE 0 END                 AS QTYUNSOLD,
+    CASE WHEN SA.TOTAL_QTY > 0
+         THEN COALESCE(SALES.QTYSOLD, 0)
+         ELSE 0 END                 AS QTYSOLD,
+    SQ.QTYSCHED,
+    COALESCE(IA.QTYINV, 0)         AS QTYINV,
+    COALESCE(RS.QTYRETSUPP, 0)     AS QTYRETSUPP,
+    COALESCE(IA.AMTINV, 0)         AS AMTINV,
+    COALESCE(IA.CSTINV, 0)         AS CSTINV,
+    -- Net total of all supplier invoices, credit memos, and debit memos.
+    -- PINVOICE.SNS_0 carries the accounting sign so credits reduce this total.
+    COALESCE(LSI.SUPPINVTOT, 0)    AS SUPPINVTOT,
+    COALESCE(LA.INFRDRAY, 0)       AS INFRDRAY,
+    COALESCE(LA.INFRRAIL, 0)       AS INFRRAIL,
+    COALESCE(LA.INFRTL, 0)         AS INFRTL,
+    COALESCE(LA.INFRBT, 0)         AS INFRBT,
+    COALESCE(LA.INDEM, 0)          AS INDEM,
+    COALESCE(LA.INTERM, 0)         AS INTERM,
+    COALESCE(LA.INBROKER, 0)       AS INBROKER,
+    COALESCE(LA.BOLIN, 0)          AS BOLIN,
+    COALESCE(LA.MISCIN, 0)         AS MISCIN,
+    COALESCE(LA.INFRCHA, 0)        AS INFRCHA,
+    COALESCE(LA.INFROCEAN, 0)      AS INFROCEAN,
+    COALESCE(LOA.WARETRAN, 0)      AS WARETRAN,
+    COALESCE(LOA.OUTFROCEAN, 0)    AS OUTFROCEAN,
+    COALESCE(LOA.OUTFROCED, 0)     AS OUTFROCED,
+    COALESCE(LOA.OUTFRDRAY, 0)     AS OUTFRDRAY,
+    COALESCE(LOA.OUTFRTL, 0)       AS OUTFRTL,
+    COALESCE(LOA.OUTFRBT, 0)       AS OUTFRBT,
+    COALESCE(LOA.OUTFRRAIL, 0)     AS OUTFRRAIL,
+    COALESCE(LOA.OUTBROKER, 0)     AS OUTBROKER,
+    COALESCE(LOA.BOLOUT, 0)        AS BOLOUT,
+    COALESCE(LOA.MISCOUT, 0)       AS MISCOUT,
+    COALESCE(LOA.OUTFROCEDN, 0)    AS OUTFROCEDN,
+    COALESCE(LOA.OUTFRDRAYN, 0)    AS OUTFRDRAYN,
+    COALESCE(LOA.OUTFRCHA, 0)      AS OUTFRCHA,
+    COALESCE(LIA.ACC_51104, 0)     AS DRAYINACT,
+    COALESCE(LIA.ACC_51107, 0)     AS RAILINACT,
+    COALESCE(LIA.ACC_51105, 0)     AS OCEANINACT,
+    COALESCE(LIA.ACC_51108, 0)     AS TLINACT,
+    COALESCE(LIA.ACC_51109, 0)     AS BTINACT,
+    COALESCE(LIA.ACC_51103, 0)     AS DEMGINACT,
+    COALESCE(LIA.ACC_60110, 0)     AS TERMINACT,
+    COALESCE(LIA.ACC_51120, 0)     AS BROKEINACT,
+    COALESCE(LIA.ACC_51111, 0)     AS BOLINACT,
+    COALESCE(LIA.ACC_51102, 0)     AS MISCINACT,
+    COALESCE(LIA.ACC_51122, 0)     AS INFRCHAACT,
+    COALESCE(LOACT.ACCT_51106, 0)  AS WARETRANACT,
+    COALESCE(LOACT.ACCT_60002, 0)  AS OCEANOUTACT,
+    COALESCE(LOACT.ACCT_60003, 0)  AS OCEANDOUTACT,
+    COALESCE(LOACT.ACCT_60005, 0)  AS DRAYOUTACT,
+    COALESCE(LOACT.ACCT_60006, 0)  AS TLOUTACT,
+    COALESCE(LOACT.ACCT_60004, 0)  AS BTOUTACT,
+    COALESCE(LOACT.ACCT_60001, 0)  AS RAILOUTACT,
+    COALESCE(LOACT.ACCT_60009, 0)  AS BROKEOUTACT,
+    COALESCE(LOACT.ACCT_60008, 0)  AS BOLOUTACT,
+    COALESCE(LOACT.ACCT_60010, 0)  AS MISCOUTACT,
+    COALESCE(LOACT.ACCT_60011, 0)  AS OUTFROCEDNAT,
+    COALESCE(LOACT.ACCT_60012, 0)  AS OUTFRDRAYNAT,
+    COALESCE(LOACT.ACCT_60013, 0)  AS OUTFRCHAACT,
+    COALESCE(SOA.SALESORDERS, '')   AS SALESORDERS,
+    COALESCE(IA.INVNUMBERS, '')     AS INVNUMBERS,
+    COALESCE(IA.CUSTOMERNAMES, '')  AS CUSTOMERNAMES,
+    COALESCE(RC2.QTYRETCUST, 0)    AS QTYRETCUST
 
-    SA_ST.QOHLBS,
-    -- QTYUNSOLD / QTYSOLD: only meaningful while stock is on hand
-    CASE WHEN SA_ST.QOHLBS > 0 THEN SA_ST.QOHLBS - COALESCE(SAGG.QTYSOLD, 0) ELSE 0 END AS QTYUNSOLD,
-    CASE WHEN SA_ST.QOHLBS > 0 THEN                COALESCE(SAGG.QTYSOLD, 0)  ELSE 0 END AS QTYSOLD,
+FROM LOT_ITEM_BASE SL
+LEFT JOIN STOCK_AGG              SA    ON SA.LOT_0    = SL.LOT_0 AND SA.ITMREF_0    = SL.ITMREF_0
+LEFT JOIN STOFLD2_AGG            SF2   ON SF2.LOT_0   = SL.LOT_0 AND SF2.ITMREF_0   = SL.ITMREF_0
+LEFT JOIN SUPPLIERS              SUP   ON SUP.LOT_0   = SL.LOT_0
+LEFT JOIN DELIVERIES_AGG         DEL   ON DEL.LOT_0   = SL.LOT_0 AND DEL.ITMREF_0   = SL.ITMREF_0
+LEFT JOIN PURTYPE_AGG            PT    ON PT.LOT_0    = SL.LOT_0 AND PT.ITMREF_0    = SL.ITMREF_0
+LEFT JOIN SHIPMENT_AGG           SHM   ON SHM.LOT_0   = SL.LOT_0 AND SHM.ITMREF_0   = SL.ITMREF_0
+LEFT JOIN RAILCAR_AGG            RC    ON RC.LOT_0    = SL.LOT_0 AND RC.ITMREF_0    = SL.ITMREF_0
+LEFT JOIN RECEIPT_AGG            RA    ON RA.LOT_0    = SL.LOT_0
+LEFT JOIN CONT_ETA_AGG           CE    ON CE.LOT_0    = SL.LOT_0 AND CE.ITMREF_0    = SL.ITMREF_0
+LEFT JOIN PUR_COSTS              PC    ON PC.LOT_0    = SL.LOT_0
+LEFT JOIN PACK_COST              PAK   ON PAK.LOT_0   = SL.LOT_0 AND PAK.ITMREF_0   = SL.ITMREF_0
+LEFT JOIN PO_LINE_QTY            PLQ   ON PLQ.LOT_0   = SL.LOT_0
+LEFT JOIN PO_REC_QTY             PRQ   ON PRQ.LOT_0   = SL.LOT_0
+LEFT JOIN QTY_ADJ                QA    ON QA.LOT_0    = SL.LOT_0
+LEFT JOIN SALES_AGG              SALES ON SALES.LOT_0 = SL.LOT_0
+LEFT JOIN SCHED_QTY              SQ    ON SQ.STOCOU_0 = SA.STOCOU_0
+LEFT JOIN INV_AGG                IA    ON IA.LOT_0    = SL.LOT_0 AND IA.ITMREF_0    = SL.ITMREF_0
+LEFT JOIN RET_SUPP               RS    ON RS.LOT_0    = SL.LOT_0
+LEFT JOIN RET_CUST               RC2   ON RC2.LOT_0   = SL.LOT_0
+LEFT JOIN CURRENTSITE_AGG        CS    ON CS.LOT_0    = SL.LOT_0 AND CS.ITMREF_0    = SL.ITMREF_0
+LEFT JOIN LOT_SUPP_INV           LSI   ON LSI.LOT_0   = SL.LOT_0
+LEFT JOIN LOT_ACCRUALS           LA    ON LA.LOT_0    = SL.LOT_0
+LEFT JOIN LOT_OUTBOUND_ACCRUALS  LOA   ON LOA.LOT_0   = SL.LOT_0 AND LOA.ITMREF_0   = SL.ITMREF_0
+LEFT JOIN LOT_INBOUND_ACTUALS    LIA   ON LIA.LOT_0   = SL.LOT_0
+LEFT JOIN LOT_OUTBOUND_ACTUALS   LOACT ON LOACT.LOT_0 = SL.LOT_0 AND LOACT.ITMREF_0 = SL.ITMREF_0
+LEFT JOIN SALES_ORDERS_AGG       SOA   ON SOA.LOT_0   = SL.LOT_0 AND SOA.ITMREF_0   = SL.ITMREF_0
 
-    COALESCE(SCH.QTYSCHED,   0)                                         AS QTYSCHED,
-    COALESCE(IA.QTYINV,      0)                                         AS QTYINV,
-    COALESCE(SJA.QTYRETSUPP, 0)                                         AS QTYRETSUPP,
-    COALESCE(IA.AMTINV,      0)                                         AS AMTINV
-
-FROM           lot_filter   LF
-
--- Stock (one aggregated row per lot – no duplicate risk)
-LEFT JOIN      stock_agg    SA_ST ON SA_ST.LOT_0 = LF.LOT_0 AND SA_ST.ITMREF_0 = LF.ITMREF_0
-
--- String lists
-LEFT JOIN      supplier_list SUP  ON SUP.LOT_0   = LF.LOT_0
-LEFT JOIN      delivery_list DL   ON DL.LOT_0    = LF.LOT_0 AND DL.ITMREF_0   = LF.ITMREF_0
-LEFT JOIN      po_agg        PA   ON PA.LOT_0    = LF.LOT_0
-LEFT JOIN      railcar_agg   RA   ON RA.LOT_0    = LF.LOT_0
-LEFT JOIN      receipt_agg   RA2  ON RA2.LOT_0   = LF.LOT_0
-
--- Aggregated scalars
-LEFT JOIN      stojou_agg   SJA   ON SJA.LOT_0   = LF.LOT_0 AND SJA.ITMREF_0  = LF.ITMREF_0
-LEFT JOIN      pack_cost    PC    ON PC.LOT_0     = LF.LOT_0 AND PC.ITMREF_0   = LF.ITMREF_0
-LEFT JOIN      po_receipt_qty PRQ ON PRQ.LOT_0    = LF.LOT_0
-LEFT JOIN      sales_agg    SAGG  ON SAGG.LOT_0   = LF.LOT_0
-LEFT JOIN      invoice_agg  IA    ON IA.LOT_0     = LF.LOT_0 AND IA.ITMREF_0   = LF.ITMREF_0
-LEFT JOIN      sched_agg    SCH   ON SCH.STOCOU_0 = SA_ST.STOCOU_0
-
-ORDER BY LF.ITMREF_0, LF.LOT_0;
+WHERE SL.LOT_0 = 'PO006602-1000';
