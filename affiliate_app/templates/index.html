@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Affiliate Post Generator</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f13;
+      --surface: #1a1a24;
+      --surface2: #23232f;
+      --border: #2e2e3e;
+      --accent: #7c5cfc;
+      --accent2: #a78bfa;
+      --fb: #1877f2;
+      --ig: #e1306c;
+      --tt: #ff0050;
+      --text: #e8e8f0;
+      --muted: #8888aa;
+      --success: #22c55e;
+      --radius: 12px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 2rem 1rem;
+    }
+
+    .container { max-width: 860px; margin: 0 auto; }
+
+    header { text-align: center; margin-bottom: 2.5rem; }
+    header h1 { font-size: 2rem; font-weight: 700; letter-spacing: -0.5px; }
+    header h1 span { color: var(--accent2); }
+    header p { color: var(--muted); margin-top: 0.5rem; font-size: 0.95rem; }
+
+    .input-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .input-row {
+      display: flex;
+      gap: 0.75rem;
+    }
+
+    .input-row input {
+      flex: 1;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      color: var(--text);
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .input-row input:focus { border-color: var(--accent); }
+    .input-row input::placeholder { color: var(--muted); }
+
+    button.generate-btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 0.75rem 1.5rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: opacity 0.2s, transform 0.1s;
+    }
+    button.generate-btn:hover { opacity: 0.88; }
+    button.generate-btn:active { transform: scale(0.97); }
+    button.generate-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .status {
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.9rem;
+      padding: 0.5rem 0;
+      min-height: 1.5rem;
+    }
+
+    .error-msg {
+      background: #2d1a1a;
+      border: 1px solid #7f2020;
+      border-radius: 8px;
+      padding: 1rem;
+      color: #ff8080;
+      margin-bottom: 1.5rem;
+      font-size: 0.9rem;
+    }
+
+    /* Product card */
+    .product-card {
+      display: flex;
+      gap: 1rem;
+      align-items: flex-start;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem;
+      margin-bottom: 2rem;
+    }
+    .product-img {
+      width: 80px;
+      height: 80px;
+      object-fit: contain;
+      border-radius: 8px;
+      background: var(--surface2);
+      flex-shrink: 0;
+    }
+    .product-info h2 { font-size: 1rem; font-weight: 600; line-height: 1.4; }
+    .product-info .price { color: var(--accent2); font-weight: 700; margin-top: 0.3rem; font-size: 1.05rem; }
+    .product-info .warn { color: #f59e0b; font-size: 0.82rem; margin-top: 0.4rem; }
+
+    /* Platform tabs */
+    .platform-tabs {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .tab-btn {
+      flex: 1;
+      padding: 0.65rem;
+      border-radius: 8px;
+      border: 2px solid transparent;
+      font-size: 0.88rem;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--surface);
+      color: var(--muted);
+      transition: all 0.15s;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn[data-platform="facebook"].active { border-color: var(--fb); color: var(--fb); }
+    .tab-btn[data-platform="instagram"].active { border-color: var(--ig); color: var(--ig); }
+    .tab-btn[data-platform="tiktok"].active { border-color: var(--tt); color: var(--tt); }
+
+    /* Platform panel */
+    .platform-panel { display: none; }
+    .platform-panel.active { display: block; }
+
+    .section-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    @media (max-width: 600px) {
+      .section-grid { grid-template-columns: 1fr; }
+      .input-row { flex-direction: column; }
+    }
+
+    .content-block {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem;
+    }
+
+    .content-block.full-width {
+      grid-column: 1 / -1;
+    }
+
+    .content-block h3 {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--muted);
+      margin-bottom: 0.75rem;
+      font-weight: 600;
+    }
+
+    .content-block .body-text {
+      font-size: 0.9rem;
+      line-height: 1.65;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .copy-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      margin-top: 0.75rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.35rem 0.75rem;
+      font-size: 0.78rem;
+      color: var(--muted);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+    .copy-btn.copied { color: var(--success); border-color: var(--success); }
+
+    .spinner {
+      display: inline-block;
+      width: 16px; height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #results { display: none; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Affiliate <span>Post Generator</span></h1>
+    <p>Paste your Amazon affiliate link and get ready-to-post content for every platform.</p>
+  </header>
+
+  <div class="input-card">
+    <div class="input-row">
+      <input id="url-input" type="url" placeholder="Paste your Amazon affiliate link here…" />
+      <button class="generate-btn" id="generate-btn" onclick="generate()">Generate</button>
+    </div>
+    <p class="status" id="status"></p>
+  </div>
+
+  <div id="error-box" class="error-msg" style="display:none"></div>
+
+  <div id="results">
+    <div class="product-card" id="product-card"></div>
+
+    <div class="platform-tabs">
+      <button class="tab-btn active" data-platform="facebook" onclick="switchTab('facebook')">📘 Facebook</button>
+      <button class="tab-btn" data-platform="instagram" onclick="switchTab('instagram')">📸 Instagram</button>
+      <button class="tab-btn" data-platform="tiktok" onclick="switchTab('tiktok')">🎵 TikTok</button>
+    </div>
+
+    <div id="panel-facebook" class="platform-panel active"></div>
+    <div id="panel-instagram" class="platform-panel"></div>
+    <div id="panel-tiktok" class="platform-panel"></div>
+  </div>
+</div>
+
+<script>
+  let currentTab = 'facebook';
+
+  function switchTab(platform) {
+    currentTab = platform;
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.platform === platform));
+    document.querySelectorAll('.platform-panel').forEach(p => p.classList.toggle('active', p.id === `panel-${platform}`));
+  }
+
+  function setStatus(msg, loading = false) {
+    const el = document.getElementById('status');
+    el.innerHTML = loading ? `<span class="spinner"></span>${msg}` : msg;
+  }
+
+  function copyText(text, btn) {
+    navigator.clipboard.writeText(text).then(() => {
+      btn.classList.add('copied');
+      btn.textContent = '✓ Copied';
+      setTimeout(() => { btn.classList.remove('copied'); btn.textContent = '⎘ Copy'; }, 2000);
+    });
+  }
+
+  function buildBlock(label, text, fullWidth = false) {
+    const div = document.createElement('div');
+    div.className = 'content-block' + (fullWidth ? ' full-width' : '');
+    const id = `cb-${Math.random().toString(36).slice(2)}`;
+    div.innerHTML = `
+      <h3>${label}</h3>
+      <div class="body-text" id="${id}">${escHtml(text)}</div>
+      <button class="copy-btn" onclick="copyText(document.getElementById('${id}').textContent, this)">⎘ Copy</button>
+    `;
+    return div;
+  }
+
+  function escHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function renderPlatform(platform, data) {
+    const panel = document.getElementById(`panel-${platform}`);
+    panel.innerHTML = '';
+
+    if (data.error) {
+      panel.innerHTML = `<div class="error-msg">${escHtml(data.error)}</div>`;
+      return;
+    }
+
+    const grid = document.createElement('div');
+    grid.className = 'section-grid';
+    grid.appendChild(buildBlock('Caption', data.caption || ''));
+    grid.appendChild(buildBlock('Content Ideas', data.content_ideas || ''));
+    grid.appendChild(buildBlock('Image Suggestions', data.image_suggestions || ''));
+    grid.appendChild(buildBlock('Video Script', data.script || '', true));
+    panel.appendChild(grid);
+  }
+
+  async function generate() {
+    const url = document.getElementById('url-input').value.trim();
+    if (!url) { setStatus('Please enter an Amazon affiliate link.'); return; }
+
+    const btn = document.getElementById('generate-btn');
+    btn.disabled = true;
+    document.getElementById('error-box').style.display = 'none';
+    document.getElementById('results').style.display = 'none';
+    setStatus('Fetching product details from Amazon…', true);
+
+    try {
+      const res = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+
+      const json = await res.json();
+
+      if (!res.ok) {
+        document.getElementById('error-box').textContent = json.error || 'Unknown error';
+        document.getElementById('error-box').style.display = 'block';
+        setStatus('');
+        return;
+      }
+
+      setStatus('Generating content for all platforms…', true);
+
+      // Product card
+      const p = json.product;
+      const card = document.getElementById('product-card');
+      card.innerHTML = `
+        ${p.image_url ? `<img class="product-img" src="${escHtml(p.image_url)}" alt="product" />` : ''}
+        <div class="product-info">
+          <h2>${escHtml(p.title || 'Product')}</h2>
+          ${p.price ? `<div class="price">${escHtml(p.price)}</div>` : ''}
+          ${p.scrape_warning ? `<div class="warn">⚠ ${escHtml(p.scrape_warning)}</div>` : ''}
+        </div>
+      `;
+
+      for (const platform of ['facebook', 'instagram', 'tiktok']) {
+        renderPlatform(platform, json.platforms[platform] || {});
+      }
+
+      document.getElementById('results').style.display = 'block';
+      setStatus('Done! Switch between tabs to see each platform\'s content.');
+    } catch (err) {
+      document.getElementById('error-box').textContent = `Network error: ${err.message}`;
+      document.getElementById('error-box').style.display = 'block';
+      setStatus('');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById('url-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') generate();
+  });
+</script>
+</body>
+</html>
